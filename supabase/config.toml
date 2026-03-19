@@ -1,0 +1,4 @@
+project_id = "pbrvechgdxzfpkjmkmvz"
+
+[functions.defai-agent]
+verify_jwt = false
