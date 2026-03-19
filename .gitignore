@@ -35,3 +35,6 @@ ignition/deployments
 # Environment files (never commit secrets)
 .env
 .env.*
+
+# Local tooling bundles (not part of app)
+/tools/

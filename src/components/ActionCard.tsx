@@ -9,6 +9,8 @@ export type IntentType =
   | "unlend"
   | "stake"
   | "unstake"
+  | "addLiquidity"
+  | "removeLiquidity"
   | "mint"
   | "launchpad"
   | "points"
@@ -18,9 +20,22 @@ export type IntentType =
 
 export interface AIParams {
   amount?: string;
+  // Used for percentage-based amount selection that derives from wallet or staked balance.
+  basisAmount?: string; // human-readable number (e.g. "27135")
+  basisType?: "wallet" | "staked";
   fromToken?: string;
   toToken?: string;
   token?: string;
+  amount0?: string;
+  amount1?: string;
+  usdcEquivalentTotal?: string;
+  token0?: string;
+  token1?: string;
+  lpAmount?: string;
+  requiresPair?: string;
+  availablePairs?: string;
+  requiresAmount?: string;
+  suggestedPercents?: string;
   estimatedOutput?: string;
   exchangeRate?: string;
   route?: string;
@@ -89,6 +104,8 @@ const INTENT_CONFIG: Record<IntentType, { icon: React.ElementType; title: string
   unlend: { icon: ArrowDownUp, title: "Lending Withdraw", color: "text-warning" },
   stake: { icon: Coins, title: "Staking", color: "text-primary" },
   unstake: { icon: ArrowDownUp, title: "Unstaking", color: "text-warning" },
+  addLiquidity: { icon: Coins, title: "Add Liquidity", color: "text-success" },
+  removeLiquidity: { icon: ArrowDownUp, title: "Remove Liquidity", color: "text-warning" },
   mint: { icon: Palette, title: "NFT Mint", color: "text-primary" },
   launchpad: { icon: Rocket, title: "Token Launchpad", color: "text-primary" },
   points: { icon: Trophy, title: "Points & Rank", color: "text-primary" },
@@ -192,6 +209,39 @@ function StakeDetails({ p, isUnstake }: { p: AIParams; isUnstake: boolean }) {
       <DataRow label="Validator" value={p.validator} />
       <DataRow label="Era Reward" value={p.eraReward} />
       {isUnstake && <DataRow label="Est. Completion" value={p.estimatedCompletion} />}
+    </div>
+  );
+}
+
+function LiquidityDetails({ p, mode }: { p: AIParams; mode: "add" | "remove" }) {
+  const token0 = p.token0 || p.fromToken || p.token || "USDC";
+  const token1 = p.token1 || p.toToken || "USDT";
+  const amount0 = p.amount0 || p.amount || "";
+  const amount1 = p.amount1 || "";
+  const lpAmount = p.lpAmount || p.amount || "";
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <div className="bg-[#171722] border border-white/10 rounded-lg p-3">
+          <p className="text-[10px] text-white/55 uppercase tracking-wide mb-1">
+            {mode === "add" ? "Deposit" : "Withdraw"}
+          </p>
+          <p className="text-lg font-semibold text-white">
+            {mode === "add"
+              ? `${amount0} ${token0}${amount1 ? ` + ${amount1} ${token1}` : ""}`
+              : `${lpAmount} LP`}
+          </p>
+        </div>
+        <div className="bg-[#171722] border border-white/10 rounded-lg p-3">
+          <p className="text-[10px] text-white/55 uppercase tracking-wide mb-1">Pool</p>
+          <p className="text-lg font-semibold text-white">{p.protocol || "DeFAI AMM Pool"}</p>
+        </div>
+      </div>
+      <DataRow label="Action" value={mode === "add" ? "Provide liquidity" : "Remove liquidity"} />
+      {mode === "add" && <DataRow label="Pair" value={`${token0}/${token1}`} />}
+      {mode === "add" && p.usdcEquivalentTotal && (
+        <DataRow label="Total (USDC equivalent)" value={p.usdcEquivalentTotal} />
+      )}
     </div>
   );
 }
@@ -322,6 +372,8 @@ export default function ActionCard({ draft, onClose, onExecute }: ActionCardProp
         {draft.intent === "unlend" && <LendDetails p={draft.params} isUnlend />}
         {draft.intent === "stake" && <StakeDetails p={draft.params} isUnstake={false} />}
         {draft.intent === "unstake" && <StakeDetails p={draft.params} isUnstake={true} />}
+        {draft.intent === "addLiquidity" && <LiquidityDetails p={draft.params} mode="add" />}
+        {draft.intent === "removeLiquidity" && <LiquidityDetails p={draft.params} mode="remove" />}
         {draft.intent === "mint" && <MintDetails p={draft.params} />}
         {draft.intent === "launchpad" && <LaunchDetails p={draft.params} />}
         {draft.intent === "points" && <PointsDetails p={draft.params} />}

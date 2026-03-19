@@ -61,7 +61,21 @@ export function useTransactionHistory(walletAddress?: string) {
     async (draft: TransactionDraft, txHash?: string, blockNumber?: bigint) => {
       if (!walletAddress) return null;
 
-      const amount = parseFloat(draft.params.amount || "0");
+      const amount = (() => {
+        if (draft.intent === "addLiquidity") {
+          const totalEquivalent = parseFloat(draft.params.usdcEquivalentTotal || "0");
+          if (Number.isFinite(totalEquivalent) && totalEquivalent > 0) return totalEquivalent;
+          const a0 = parseFloat(draft.params.amount0 || "0");
+          const a1 = parseFloat(draft.params.amount1 || "0");
+          return (Number.isFinite(a0) ? a0 : 0) + (Number.isFinite(a1) ? a1 : 0);
+        }
+        if (draft.intent === "removeLiquidity") {
+          const lp = parseFloat(draft.params.lpAmount || "0");
+          return Number.isFinite(lp) ? lp : 0;
+        }
+        const base = parseFloat(draft.params.amount || "0");
+        return Number.isFinite(base) ? base : 0;
+      })();
       const fee = (amount * PLATFORM_FEE_RATE).toFixed(6);
 
       const insertData = {

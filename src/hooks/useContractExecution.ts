@@ -7,13 +7,12 @@ import { baseSepolia, config as wagmiConfig, polkadotHub } from "@/lib/wagmi-con
 import {
   ERC20_ABI,
   DEFAI_ACCESS_PASS_NFT_ABI,
-  DEFAI_SIMPLE_SWAP_ABI,
+  DEFAI_AMM_POOL_ABI,
   DEFAI_STAKING_VAULT_ABI,
   DEFAI_BRIDGE_GATEWAY_ABI,
   DEFAI_TOKEN_FACTORY_ABI,
   BASE_TOKENS,
   HUB_TOKENS,
-  HUB_DEX_ROUTER,
   HUB_STAKING_VAULTS,
   HUB_ACCESS_PASS_NFT,
   HUB_TOKEN_FACTORY,
@@ -21,6 +20,7 @@ import {
   BASE_BRIDGE_GATEWAY,
   BASE_SEPOLIA_CHAIN_ID,
 } from "@/lib/contracts";
+import { HUB_AMM_POOLS, ammPairKey } from "@/lib/amm-pools";
 import type { TransactionDraft } from "@/components/ActionCard";
 
 export type ExecutionStep =
@@ -47,6 +47,12 @@ export interface ExecutionResult {
   chainId?: number;
   pending?: boolean;
   error?: string;
+  swap?: {
+    fromToken: string;
+    toToken: string;
+    amountIn: string;
+    amountOutEstimated: string;
+  };
 }
 
 export function useContractExecution() {
@@ -119,6 +125,12 @@ export function useContractExecution() {
     return HUB_TOKENS[upper] ?? null;
   };
 
+  const resolveAmmPool = (aSym: string, bSym: string): Address | null => {
+    const k1 = ammPairKey(aSym, bSym);
+    const k2 = ammPairKey(bSym, aSym);
+    return (HUB_AMM_POOLS[k1] || HUB_AMM_POOLS[k2] || null) as Address | null;
+  };
+
   const resolveBridgeToken = (sourceChainId: number, symbol?: string): Address | null => {
     const upper = normalizeSymbol(symbol);
     if (!upper) return null;
@@ -144,35 +156,47 @@ export function useContractExecution() {
       }
       const activeWalletClient = await getActiveWalletClient();
 
-      if (isZeroAddress(HUB_DEX_ROUTER)) {
-        throw new Error("Swap contract is not configured.");
-      }
-
       const { params } = draft;
       const fromToken = resolveToken(params.fromToken);
       const toToken = resolveToken(params.toToken);
       const fromTokenSymbol = normalizeSymbol(params.fromToken);
       const toTokenSymbol = normalizeSymbol(params.toToken);
+      const pool = resolveAmmPool(fromTokenSymbol, toTokenSymbol);
+      if (!pool || isZeroAddress(pool)) {
+        throw new Error(`AMM pool is not configured for ${fromTokenSymbol}/${toTokenSymbol}.`);
+      }
       const amountRaw = sanitizeAmount(params.amount, "0");
       const slippageBps = parseSlippageBps(params.slippage);
       if (!fromToken || !toToken) {
         throw new Error("Swap supports configured ERC20 pairs (USDC/USDT) for this demo.");
       }
 
-      const configuredRate = (await publicClient.readContract({
-        address: HUB_DEX_ROUTER,
-        abi: DEFAI_SIMPLE_SWAP_ABI,
-        functionName: "pairRate",
-        args: [fromToken, toToken],
-      })) as bigint;
-      if (configuredRate === 0n) {
+      const poolToken0 = (await publicClient.readContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "token0",
+      })) as Address;
+      const poolToken1 = (await publicClient.readContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "token1",
+      })) as Address;
+      const inPool =
+        (fromToken.toLowerCase() === poolToken0.toLowerCase() && toToken.toLowerCase() === poolToken1.toLowerCase()) ||
+        (fromToken.toLowerCase() === poolToken1.toLowerCase() && toToken.toLowerCase() === poolToken0.toLowerCase());
+      if (!inPool) {
         throw new Error(
-          `Swap pair not configured on-chain for ${fromTokenSymbol || "tokenIn"} -> ${toTokenSymbol || "tokenOut"}.`
+          `AMM pool does not support ${fromTokenSymbol || "tokenIn"} -> ${toTokenSymbol || "tokenOut"} on this network.`
         );
       }
 
       const fromDecimals = (await publicClient.readContract({
         address: fromToken,
+        abi: ERC20_ABI,
+        functionName: "decimals",
+      })) as number;
+      const toDecimals = (await publicClient.readContract({
+        address: toToken,
         abi: ERC20_ABI,
         functionName: "decimals",
       })) as number;
@@ -194,7 +218,7 @@ export function useContractExecution() {
         address: fromToken,
         abi: ERC20_ABI,
         functionName: "allowance",
-        args: [address, HUB_DEX_ROUTER],
+        args: [address, pool],
       })) as bigint;
 
       if (allowance < amountIn) {
@@ -202,7 +226,7 @@ export function useContractExecution() {
           address: fromToken,
           abi: ERC20_ABI,
           functionName: "approve",
-          args: [HUB_DEX_ROUTER, amountIn],
+          args: [pool, amountIn],
           chain: polkadotHub,
           account: address,
         });
@@ -211,32 +235,309 @@ export function useContractExecution() {
 
       setState((s) => ({ ...s, step: "simulating" }));
       const expectedOut = (await publicClient.readContract({
-        address: HUB_DEX_ROUTER,
-        abi: DEFAI_SIMPLE_SWAP_ABI,
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
         functionName: "quote",
-        args: [fromToken, toToken, amountIn],
+        args: [fromToken, amountIn],
       })) as bigint;
       const amountOutMin = amountOutMinFromSlippage(expectedOut, slippageBps);
 
       await publicClient.simulateContract({
-        address: HUB_DEX_ROUTER,
-        abi: DEFAI_SIMPLE_SWAP_ABI,
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
         functionName: "swapExactInput",
-        args: [fromToken, toToken, amountIn, amountOutMin, address],
+        args: [fromToken, amountIn, amountOutMin, address],
         account: address,
       });
 
       setState((s) => ({ ...s, step: "awaiting-signature" }));
       const hash = await activeWalletClient.writeContract({
-        address: HUB_DEX_ROUTER,
-        abi: DEFAI_SIMPLE_SWAP_ABI,
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
         functionName: "swapExactInput",
-        args: [fromToken, toToken, amountIn, amountOutMin, address],
+        args: [fromToken, amountIn, amountOutMin, address],
         chain: polkadotHub,
         account: address,
       });
 
-      return hash;
+      return {
+        hash,
+        swap: {
+          fromToken: fromTokenSymbol,
+          toToken: toTokenSymbol,
+          amountIn: formatUnits(amountIn, fromDecimals),
+          amountOutEstimated: formatUnits(expectedOut, toDecimals),
+        },
+      };
+    },
+    [address, publicClient, getActiveWalletClient]
+  );
+
+  const executeAddLiquidity = useCallback(
+    async (draft: TransactionDraft) => {
+      if (!address || !publicClient) {
+        throw new Error("Wallet not connected");
+      }
+      const activeWalletClient = await getActiveWalletClient();
+
+      const p = draft.params;
+      const sym0 = normalizeSymbol(p.token0 || p.fromToken || "USDC");
+      const sym1 = normalizeSymbol(p.token1 || p.toToken || "USDT");
+      const pool = resolveAmmPool(sym0, sym1);
+      if (!pool || isZeroAddress(pool)) {
+        throw new Error(`AMM pool is not configured for ${sym0}/${sym1}.`);
+      }
+      const token0 = resolveToken(sym0);
+      const token1 = resolveToken(sym1);
+      if (!token0 || !token1) throw new Error("Liquidity supports configured demo ERC20 tokens (e.g. USDC/USDT).");
+
+      const decimals0 = (await publicClient.readContract({
+        address: token0,
+        abi: ERC20_ABI,
+        functionName: "decimals",
+      })) as number;
+      const decimals1 = (await publicClient.readContract({
+        address: token1,
+        abi: ERC20_ABI,
+        functionName: "decimals",
+      })) as number;
+
+      // Ensure the chosen pair matches the pool
+      const poolToken0 = (await publicClient.readContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "token0",
+      })) as Address;
+      const poolToken1 = (await publicClient.readContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "token1",
+      })) as Address;
+      const matchesPool =
+        token0.toLowerCase() === poolToken0.toLowerCase() && token1.toLowerCase() === poolToken1.toLowerCase();
+      const matchesReversed =
+        token0.toLowerCase() === poolToken1.toLowerCase() && token1.toLowerCase() === poolToken0.toLowerCase();
+      if (!matchesPool && !matchesReversed) {
+        throw new Error(`This AMM pool only supports ${sym0}/${sym1} if it matches the deployed pair.`);
+      }
+
+      const token0Pool = matchesPool ? token0 : token1;
+      const token1Pool = matchesPool ? token1 : token0;
+      const decimals0Pool = matchesPool ? decimals0 : decimals1;
+      const decimals1Pool = matchesPool ? decimals1 : decimals0;
+
+      let amount0Pool: bigint;
+      let amount1Pool: bigint;
+      const equivalentTotalRaw = sanitizeAmount(p.usdcEquivalentTotal, "");
+      const hasEquivalentMode = equivalentTotalRaw.length > 0 && Number(equivalentTotalRaw) > 0;
+
+      if (hasEquivalentMode) {
+        const stableSymbols = new Set(["USDC", "USDT"]);
+        const poolSym0 = matchesPool ? sym0 : sym1;
+        const poolSym1 = matchesPool ? sym1 : sym0;
+        const stableIsToken0 = stableSymbols.has(poolSym0);
+        const stableIsToken1 = stableSymbols.has(poolSym1);
+        if (!stableIsToken0 && !stableIsToken1) {
+          throw new Error("USDC-equivalent mode requires one side of the pair to be USDC or USDT.");
+        }
+
+        const total = Number(equivalentTotalRaw);
+        const half = total / 2;
+        const halfRaw = Number.isFinite(half) && half > 0 ? String(half) : "0";
+        if (halfRaw === "0") {
+          throw new Error("Equivalent total must be greater than 0.");
+        }
+
+        if (stableIsToken0) {
+          const stableIn = parseUnits(halfRaw, decimals0Pool);
+          const otherOut = (await publicClient.readContract({
+            address: pool,
+            abi: DEFAI_AMM_POOL_ABI,
+            functionName: "quote",
+            args: [token0Pool, stableIn],
+          })) as bigint;
+          amount0Pool = stableIn;
+          amount1Pool = otherOut;
+        } else {
+          const stableIn = parseUnits(halfRaw, decimals1Pool);
+          const otherOut = (await publicClient.readContract({
+            address: pool,
+            abi: DEFAI_AMM_POOL_ABI,
+            functionName: "quote",
+            args: [token1Pool, stableIn],
+          })) as bigint;
+          amount0Pool = otherOut;
+          amount1Pool = stableIn;
+        }
+      } else {
+        const amount0Raw = sanitizeAmount(p.amount0 || p.amount, "0");
+        const amount1Raw = sanitizeAmount(p.amount1, "0");
+        const amount0Desired = parseUnits(amount0Raw, decimals0);
+        const amount1Desired = parseUnits(amount1Raw, decimals1);
+        if (amount0Desired === 0n || amount1Desired === 0n) throw new Error("Both token amounts must be greater than 0.");
+        // If user provides in reverse order, map into pool order
+        amount0Pool = matchesPool ? amount0Desired : amount1Desired;
+        amount1Pool = matchesPool ? amount1Desired : amount0Desired;
+      }
+
+      const bal0 = (await publicClient.readContract({
+        address: token0Pool,
+        abi: ERC20_ABI,
+        functionName: "balanceOf",
+        args: [address],
+      })) as bigint;
+      const bal1 = (await publicClient.readContract({
+        address: token1Pool,
+        abi: ERC20_ABI,
+        functionName: "balanceOf",
+        args: [address],
+      })) as bigint;
+      if (bal0 < amount0Pool) {
+        throw new Error(
+          `Insufficient ${matchesPool ? sym0 : sym1} balance. Need ${formatUnits(amount0Pool, decimals0Pool)}, wallet has ${formatUnits(bal0, decimals0Pool)}.`
+        );
+      }
+      if (bal1 < amount1Pool) {
+        throw new Error(
+          `Insufficient ${matchesPool ? sym1 : sym0} balance. Need ${formatUnits(amount1Pool, decimals1Pool)}, wallet has ${formatUnits(bal1, decimals1Pool)}.`
+        );
+      }
+
+      setState((s) => ({ ...s, step: "approving" }));
+      const allow0 = (await publicClient.readContract({
+        address: token0Pool,
+        abi: ERC20_ABI,
+        functionName: "allowance",
+        args: [address, pool],
+      })) as bigint;
+      if (allow0 < amount0Pool) {
+        const approveHash = await activeWalletClient.writeContract({
+          address: token0Pool,
+          abi: ERC20_ABI,
+          functionName: "approve",
+          args: [pool, amount0Pool],
+          chain: polkadotHub,
+          account: address,
+        });
+        await publicClient.waitForTransactionReceipt({ hash: approveHash });
+      }
+      const allow1 = (await publicClient.readContract({
+        address: token1Pool,
+        abi: ERC20_ABI,
+        functionName: "allowance",
+        args: [address, pool],
+      })) as bigint;
+      if (allow1 < amount1Pool) {
+        const approveHash = await activeWalletClient.writeContract({
+          address: token1Pool,
+          abi: ERC20_ABI,
+          functionName: "approve",
+          args: [pool, amount1Pool],
+          chain: polkadotHub,
+          account: address,
+        });
+        await publicClient.waitForTransactionReceipt({ hash: approveHash });
+      }
+
+      // Pool addLiquidity may consume less of one side to maintain ratio.
+      // For this demo flow, keep mins at 0 to avoid false SlippageExceeded reverts.
+      const min0 = 0n;
+      const min1 = 0n;
+
+      setState((s) => ({ ...s, step: "simulating" }));
+      await publicClient.simulateContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "addLiquidity",
+        args: [amount0Pool, amount1Pool, min0, min1, address],
+        account: address,
+      });
+
+      setState((s) => ({ ...s, step: "awaiting-signature" }));
+      return activeWalletClient.writeContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "addLiquidity",
+        args: [amount0Pool, amount1Pool, min0, min1, address],
+        chain: polkadotHub,
+        account: address,
+      });
+    },
+    [address, publicClient, getActiveWalletClient]
+  );
+
+  const executeRemoveLiquidity = useCallback(
+    async (draft: TransactionDraft) => {
+      if (!address || !publicClient) {
+        throw new Error("Wallet not connected");
+      }
+      const activeWalletClient = await getActiveWalletClient();
+
+      const p = draft.params;
+      const sym0 = normalizeSymbol(p.token0 || p.fromToken || "USDC");
+      const sym1 = normalizeSymbol(p.token1 || p.toToken || "USDT");
+      const pool = resolveAmmPool(sym0, sym1);
+      if (!pool || isZeroAddress(pool)) {
+        throw new Error(`AMM pool is not configured for ${sym0}/${sym1}.`);
+      }
+      const lpInput = String(p.lpAmount || p.amount || "").trim();
+      const lpDecimals = 18;
+      if (!lpInput) {
+        throw new Error("Please specify how much liquidity to remove (e.g. 25%, 50%, 100%, or an LP amount).");
+      }
+
+      const lpBal = (await publicClient.readContract({
+        address: pool,
+        abi: ERC20_ABI,
+        functionName: "balanceOf",
+        args: [address],
+      })) as bigint;
+      let liquidity: bigint;
+      if (/^(all|max)$/i.test(lpInput)) {
+        liquidity = lpBal;
+      } else if (lpInput.endsWith("%")) {
+        const pct = Number(lpInput.slice(0, -1));
+        if (!Number.isFinite(pct) || pct <= 0) {
+          throw new Error("LP percentage must be greater than 0%.");
+        }
+        if (pct > 100) {
+          throw new Error("LP percentage cannot exceed 100%.");
+        }
+        const bps = BigInt(Math.round(pct * 100));
+        liquidity = (lpBal * bps) / 10000n;
+      } else {
+        const lpRaw = sanitizeAmount(lpInput, "0");
+        liquidity = parseUnits(lpRaw, lpDecimals);
+      }
+      if (liquidity === 0n) throw new Error("LP amount must be greater than 0.");
+      if (lpBal < liquidity) {
+        throw new Error(
+          `Insufficient LP balance. You have ${formatUnits(lpBal, lpDecimals)} LP, requested ${formatUnits(liquidity, lpDecimals)}.`
+        );
+      }
+
+      // For demo: set min amounts to 0 by default.
+      const min0 = 0n;
+      const min1 = 0n;
+
+      setState((s) => ({ ...s, step: "simulating" }));
+      await publicClient.simulateContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "removeLiquidity",
+        args: [liquidity, min0, min1, address],
+        account: address,
+      });
+
+      setState((s) => ({ ...s, step: "awaiting-signature" }));
+      return activeWalletClient.writeContract({
+        address: pool,
+        abi: DEFAI_AMM_POOL_ABI,
+        functionName: "removeLiquidity",
+        args: [liquidity, min0, min1, address],
+        chain: polkadotHub,
+        account: address,
+      });
     },
     [address, publicClient, getActiveWalletClient]
   );
@@ -664,6 +965,7 @@ export function useContractExecution() {
       reset();
       let submittedHash: Hash | undefined;
       let submittedChainId: number | undefined;
+      let swapDetails: ExecutionResult["swap"] | undefined;
 
       try {
         let hash: Hash;
@@ -671,7 +973,17 @@ export function useContractExecution() {
 
         switch (draft.intent) {
           case "swap":
-            hash = await executeSwap(draft);
+            {
+              const swapResult = await executeSwap(draft);
+              hash = swapResult.hash;
+              swapDetails = swapResult.swap;
+            }
+            break;
+          case "addLiquidity":
+            hash = await executeAddLiquidity(draft);
+            break;
+          case "removeLiquidity":
+            hash = await executeRemoveLiquidity(draft);
             break;
           case "bridge":
             {
@@ -736,6 +1048,7 @@ export function useContractExecution() {
           txHash: hash,
           blockNumber: receipt.blockNumber,
           chainId: txChainId,
+          swap: swapDetails,
         };
       } catch (err: unknown) {
         const maybeErr = err as { shortMessage?: string; message?: string };
@@ -748,6 +1061,7 @@ export function useContractExecution() {
             txHash: submittedHash,
             chainId: submittedChainId ?? chainId,
             pending: true,
+            swap: swapDetails,
           };
         }
         if (message.includes("0xe450d38c")) {
@@ -755,6 +1069,9 @@ export function useContractExecution() {
         }
         if (message.includes("0x7865bb90")) {
           message = "Swap pair is not configured on-chain for this token direction.";
+        }
+        if (message.includes("0x09aa8c39")) {
+          message = "Add/remove liquidity slippage check failed (pool ratio moved). Retry now; for demo, min constraints are relaxed.";
         }
         setState((s) => ({ ...s, step: "error", error: message }));
         toast.error(message);
@@ -764,6 +1081,8 @@ export function useContractExecution() {
     [
       reset,
       executeSwap,
+      executeAddLiquidity,
+      executeRemoveLiquidity,
       executeBridge,
       executeStake,
       executeUnstake,

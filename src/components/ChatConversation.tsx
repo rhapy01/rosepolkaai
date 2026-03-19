@@ -1,4 +1,4 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Bot, User } from "lucide-react";
 
@@ -17,10 +17,15 @@ interface ChatConversationProps {
     id: string;
     prompt: string;
     options?: string[];
+    customInput?: {
+      placeholder?: string;
+      submitLabel?: string;
+    };
   } | null;
   onConfirmYes?: () => void;
   onConfirmNo?: () => void;
   onSelectOption?: (option: string) => void;
+  onCustomInputSubmit?: (value: string) => void;
 }
 
 export default function ChatConversation({
@@ -32,9 +37,11 @@ export default function ChatConversation({
   onConfirmYes,
   onConfirmNo,
   onSelectOption,
+  onCustomInputSubmit,
 }: ChatConversationProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [customValue, setCustomValue] = useState("");
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -145,6 +152,27 @@ export default function ChatConversation({
                             {option}
                           </button>
                         ))}
+                        {pendingConfirmation.customInput && (
+                          <div className="w-full mt-3 flex items-center gap-2">
+                            <input
+                              value={customValue}
+                              onChange={(e) => setCustomValue(e.target.value)}
+                              placeholder={pendingConfirmation.customInput.placeholder || "Enter amount"}
+                              className="flex-1 text-xs px-3 py-1.5 rounded-full border border-white/10 bg-transparent text-white placeholder:text-white/35 outline-none"
+                              inputMode="decimal"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onCustomInputSubmit?.(customValue);
+                                setCustomValue("");
+                              }}
+                              className="text-xs px-3 py-1.5 rounded-full border border-primary/40 bg-primary text-white hover:bg-primary/90 transition-colors"
+                            >
+                              {pendingConfirmation.customInput.submitLabel || "Use"}
+                            </button>
+                          </div>
+                        )}
                         <button
                           type="button"
                           onClick={onConfirmNo}

@@ -3,6 +3,7 @@ import { useAccount, usePublicClient } from "wagmi";
 import { formatUnits, type Address } from "viem";
 import { useTransactionHistory } from "@/hooks/useTransactionHistory";
 import { usePortfolioBalances } from "@/hooks/usePortfolioBalances";
+import { Button } from "@/components/ui/button";
 import {
   DEFAI_ACCESS_PASS_NFT_ABI,
   DEFAI_STAKING_VAULT_ABI,
@@ -10,6 +11,7 @@ import {
   HUB_ACCESS_PASS_NFT,
   HUB_STAKING_VAULTS,
 } from "@/lib/contracts";
+import { HUB_AMM_POOLS } from "@/lib/amm-pools";
 import {
   AreaChart,
   Area,
@@ -23,6 +25,7 @@ import {
   Wallet,
   Coins,
   Landmark,
+  Droplets,
   TrendingUp,
   Loader2,
   CircleDot,
@@ -37,6 +40,11 @@ const chartConfig = {
 const PANEL_CLASS =
   "rounded-2xl border border-white/10 bg-[#0f0f15] p-4 sm:p-5 shadow-[0_8px_24px_rgba(0,0,0,0.35)]";
 const SUBTLE_BOX_CLASS = "rounded-xl border border-white/10 bg-[#171722] p-3";
+const TOKEN_DECIMALS: Record<string, number> = {
+  USDC: 18,
+  USDT: 18,
+};
+const SEEDED_BASELINE_LP = 10000n * 10n ** 18n;
 
 export default function PortfolioDashboard() {
   const { address } = useAccount();
@@ -61,6 +69,30 @@ export default function PortfolioDashboard() {
   const [nftSymbol, setNftSymbol] = useState("DFPASS");
   const [nftLoading, setNftLoading] = useState(false);
   const [nftError, setNftError] = useState<string | null>(null);
+  const [liquidityPositions, setLiquidityPositions] = useState<
+    {
+      pair: string;
+      pool: Address;
+      lpBalanceRaw: bigint;
+      lpBalanceFormatted: string;
+      token0Symbol: string;
+      token1Symbol: string;
+      amount0Formatted: string;
+      amount1Formatted: string;
+      estimatedUsdcValue?: string;
+      isLikelyCustom: boolean;
+      displayLpRaw: bigint;
+    }[]
+  >([]);
+  const [liquidityLoading, setLiquidityLoading] = useState(false);
+  const [liquidityError, setLiquidityError] = useState<string | null>(null);
+  const [showAllLiquidity, setShowAllLiquidity] = useState(false);
+
+  const visibleLiquidityPositions = useMemo(() => {
+    if (showAllLiquidity) return liquidityPositions;
+    // Wallet-only mode: show only pools where we detect non-baseline/custom LP.
+    return liquidityPositions.filter((p) => p.isLikelyCustom);
+  }, [liquidityPositions, showAllLiquidity]);
 
   useEffect(() => {
     let cancelled = false;
@@ -164,6 +196,187 @@ export default function PortfolioDashboard() {
       cancelled = true;
     };
   }, [publicClient, address]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadLiquidityPositions() {
+      if (!publicClient || !address) {
+        setLiquidityPositions([]);
+        setLiquidityLoading(false);
+        setLiquidityError(null);
+        return;
+      }
+
+      setLiquidityLoading(true);
+      setLiquidityError(null);
+
+      try {
+        const poolReads: {
+          pair: string;
+          pool: Address;
+          lpBalanceRaw: bigint;
+          token0Symbol: string;
+          token1Symbol: string;
+          token0Decimals: number;
+          token1Decimals: number;
+          amount0Formatted: string;
+          amount1Formatted: string;
+          estimatedUsdcValue?: string;
+          isLikelyCustom: boolean;
+          displayLpRaw: bigint; // computed after baseline
+          reserves0: bigint;
+          reserves1: bigint;
+          totalSupply: bigint;
+        }[] = [];
+
+        const entries = Object.entries(HUB_AMM_POOLS) as [string, Address][];
+        let failedPools = 0;
+        let minNonZeroLp: bigint | null = null;
+        for (const [pair, pool] of entries) {
+          if (!pool || pool.toLowerCase() === "0x0000000000000000000000000000000000000000") continue;
+          try {
+            const [token0SymbolRaw, token1SymbolRaw] = pair.toUpperCase().split("/");
+            const token0Symbol = token0SymbolRaw || "TOKEN0";
+            const token1Symbol = token1SymbolRaw || "TOKEN1";
+            const token0Decimals = TOKEN_DECIMALS[token0Symbol] ?? 18;
+            const token1Decimals = TOKEN_DECIMALS[token1Symbol] ?? 18;
+
+            const [lpBalance, reserves, totalSupply] = (await Promise.all([
+              publicClient.readContract({
+                address: pool,
+                abi: ERC20_ABI,
+                functionName: "balanceOf",
+                args: [address],
+              } as any),
+              publicClient.readContract({
+                address: pool,
+                abi: [
+                  {
+                    name: "getReserves",
+                    type: "function",
+                    stateMutability: "view",
+                    inputs: [],
+                    outputs: [
+                      { name: "_reserve0", type: "uint112" },
+                      { name: "_reserve1", type: "uint112" },
+                    ],
+                  },
+                ],
+                functionName: "getReserves",
+              } as any),
+              publicClient.readContract({
+                address: pool,
+                abi: [
+                  {
+                    name: "totalSupply",
+                    type: "function",
+                    stateMutability: "view",
+                    inputs: [],
+                    outputs: [{ name: "", type: "uint256" }],
+                  },
+                ],
+                functionName: "totalSupply",
+              } as any),
+            ])) as [bigint, readonly [bigint, bigint], bigint];
+
+            if (lpBalance === 0n || totalSupply === 0n) continue;
+            minNonZeroLp = minNonZeroLp === null ? lpBalance : (lpBalance < minNonZeroLp ? lpBalance : minNonZeroLp);
+
+            const [reserve0, reserve1] = reserves;
+            poolReads.push({
+              pair,
+              pool,
+              lpBalanceRaw: lpBalance,
+              token0Symbol,
+              token1Symbol,
+              token0Decimals,
+              token1Decimals,
+              amount0Formatted: "0",
+              amount1Formatted: "0",
+              estimatedUsdcValue: undefined,
+              isLikelyCustom: false,
+              displayLpRaw: 0n,
+              reserves0: reserve0,
+              reserves1: reserve1,
+              totalSupply,
+            });
+          } catch {
+            failedPools += 1;
+            continue;
+          }
+        }
+
+        if (!cancelled) {
+          const baselineLp = showAllLiquidity
+            ? 0n
+            : minNonZeroLp !== null && minNonZeroLp > 0n
+              ? minNonZeroLp
+              : SEEDED_BASELINE_LP;
+
+          const positions = poolReads
+            .map((r) => {
+              const customLp = baselineLp > 0n && r.lpBalanceRaw > baselineLp ? r.lpBalanceRaw - baselineLp : 0n;
+              const isCustom = customLp > 0n;
+              if (!showAllLiquidity && !isCustom) return null;
+
+              const shareLp = showAllLiquidity ? r.lpBalanceRaw : customLp;
+              const userAmount0 = (r.reserves0 * shareLp) / r.totalSupply;
+              const userAmount1 = (r.reserves1 * shareLp) / r.totalSupply;
+              const amount0Formatted = formatUnits(userAmount0, r.token0Decimals);
+              const amount1Formatted = formatUnits(userAmount1, r.token1Decimals);
+
+              const s0 = r.token0Symbol.toUpperCase();
+              const s1 = r.token1Symbol.toUpperCase();
+              let estimatedUsdcValue: string | undefined;
+              if (s0 === "USDC" || s0 === "USDT") {
+                estimatedUsdcValue = (Number(amount0Formatted) * 2).toFixed(4);
+              } else if (s1 === "USDC" || s1 === "USDT") {
+                estimatedUsdcValue = (Number(amount1Formatted) * 2).toFixed(4);
+              }
+
+              return {
+                pair: r.pair,
+                pool: r.pool,
+                lpBalanceRaw: r.lpBalanceRaw,
+                lpBalanceFormatted: formatUnits(shareLp, 18),
+                token0Symbol: r.token0Symbol,
+                token1Symbol: r.token1Symbol,
+                amount0Formatted,
+                amount1Formatted,
+                estimatedUsdcValue,
+                isLikelyCustom: isCustom,
+                displayLpRaw: customLp,
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x !== null);
+
+          const sorted = [...positions].sort(
+            (a, b) => Number(b.lpBalanceFormatted) - Number(a.lpBalanceFormatted)
+          );
+
+          setLiquidityPositions(sorted);
+          if (failedPools > 0 && positions.length > 0) {
+            setLiquidityError(`Loaded ${positions.length} positions. ${failedPools} pool reads timed out and were skipped.`);
+          } else if (failedPools > 0 && positions.length === 0) {
+            setLiquidityError("RPC timed out while reading AMM pools. Please retry in a moment.");
+          }
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setLiquidityPositions([]);
+          setLiquidityError(e instanceof Error ? e.message : "Failed to load liquidity positions");
+        }
+      } finally {
+        if (!cancelled) setLiquidityLoading(false);
+      }
+    }
+
+    loadLiquidityPositions();
+    return () => {
+      cancelled = true;
+    };
+  }, [publicClient, address, showAllLiquidity]);
 
   useEffect(() => {
     let cancelled = false;
@@ -399,6 +612,78 @@ export default function PortfolioDashboard() {
             Lending and unlend actions are executable in demo mode and route through the DeFAI vault rails. Dedicated lending position reads/indexer view will be added next.
           </p>
         </div>
+      </section>
+
+      {/* Liquidity positions */}
+      <section className={PANEL_CLASS}>
+        <div className="flex items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <Droplets className="w-4 h-4 text-primary" />
+            <h2 className="text-sm font-semibold text-white">
+              {showAllLiquidity ? "Liquidity Positions" : "My Liquidity Positions"}
+            </h2>
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="h-8 px-2.5 text-xs"
+            onClick={() => setShowAllLiquidity((v) => !v)}
+          >
+            {showAllLiquidity ? "Show only my liquidity" : "Show all pools"}
+          </Button>
+        </div>
+        {liquidityLoading ? (
+          <div className="flex items-center justify-center h-[80px]">
+            <Loader2 className="w-5 h-5 animate-spin text-white/50" />
+          </div>
+        ) : liquidityError ? (
+          <div className="rounded-lg bg-destructive/10 border border-destructive/20 p-3 text-xs text-destructive">
+            Failed to load liquidity positions: {liquidityError}
+          </div>
+        ) : visibleLiquidityPositions.length === 0 ? (
+          <div className={SUBTLE_BOX_CLASS}>
+            <p className="text-xs text-white/60">
+              No on-chain liquidity positions found for this wallet on tracked pools.
+              {showAllLiquidity
+                ? " If you just added LP, wait for confirmation and refresh."
+                : " You are in wallet-only mode. Toggle “Show all pools” only if you want to inspect every tracked pool."}
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {visibleLiquidityPositions.map((position) => (
+              <div
+                key={`${position.pair}-${position.pool}`}
+                className={`${SUBTLE_BOX_CLASS} flex items-center justify-between`}
+              >
+                <div>
+                  <p className="text-sm font-medium text-white">{position.pair}</p>
+                  <p className="text-[11px] text-white/50 font-mono">
+                    {position.pool.slice(0, 6)}...{position.pool.slice(-4)}
+                  </p>
+                  {position.isLikelyCustom && (
+                    <p className="text-[11px] text-success font-medium">Your added liquidity</p>
+                  )}
+                </div>
+                <div className="text-right">
+                  <p className="text-sm font-mono text-white">
+                    LP: {Number(position.lpBalanceFormatted).toLocaleString("en-US", { maximumFractionDigits: 6 })}
+                  </p>
+                  <p className="text-[11px] text-white/60 font-mono">
+                    {Number(position.amount0Formatted).toLocaleString("en-US", { maximumFractionDigits: 6 })} {position.token0Symbol}
+                    {" + "}
+                    {Number(position.amount1Formatted).toLocaleString("en-US", { maximumFractionDigits: 6 })} {position.token1Symbol}
+                  </p>
+                  {position.estimatedUsdcValue && (
+                    <p className="text-[11px] text-success font-mono">
+                      Est: ~{Number(position.estimatedUsdcValue).toLocaleString("en-US", { maximumFractionDigits: 4 })} USDC
+                    </p>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* Recent activity chart */}

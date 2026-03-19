@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
-import { useAccount, useSwitchChain } from "wagmi";
-import { MessageSquarePlus, House, LayoutDashboard, Clock3, Trophy, User, Shield, Map, Info } from "lucide-react";
+import { useAccount, usePublicClient, useSwitchChain } from "wagmi";
+import { type Address } from "viem";
+import { MessageSquarePlus, House, LayoutDashboard, Clock3, Trophy, User, Shield, Map as MapIcon, Info } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useContractExecution, type ExecutionStep } from "@/hooks/useContractExecution";
 import { useTransactionHistory } from "@/hooks/useTransactionHistory";
 import { usePortfolioBalances } from "@/hooks/usePortfolioBalances";
 import { polkadotHub } from "@/lib/wagmi-config";
-import { BASE_SEPOLIA_CHAIN_ID } from "@/lib/contracts";
+import { BASE_SEPOLIA_CHAIN_ID, HUB_TOKENS } from "@/lib/contracts";
 import CommandBar from "@/components/CommandBar";
 import ChatConversation, { type ChatMessage } from "@/components/ChatConversation";
 import ActionCard, { type TransactionDraft } from "@/components/ActionCard";
@@ -22,6 +23,8 @@ import AdminPanel from "@/components/AdminPanel";
 import PortfolioDashboard from "@/components/PortfolioDashboard";
 import RoadmapPanel from "@/components/RoadmapPanel";
 import AboutPanel from "@/components/AboutPanel";
+import { HUB_AMM_POOLS } from "@/lib/amm-pools";
+import { DEFAI_STAKING_VAULT_ABI, ERC20_ABI, HUB_STAKING_VAULTS, HUB_STAKEABLE_SYMBOLS } from "@/lib/contracts";
 
 interface ActiveAction {
   id: string;
@@ -33,7 +36,11 @@ interface PendingConfirmation {
   draft: TransactionDraft;
   prompt: string;
   options?: string[];
-  selectionField?: "toToken" | "token";
+  selectionField?: "toToken" | "token" | "fromToken" | "amount" | "liquidityPair" | "lpAmount";
+  customInput?: {
+    placeholder?: string;
+    submitLabel?: string;
+  };
 }
 
 interface ConversationThread {
@@ -45,11 +52,36 @@ interface ConversationThread {
   updatedAt: number;
 }
 
+interface WalletContextPayload {
+  walletAddress?: string;
+  chainId?: number;
+  balances: { symbol: string; formatted: string }[];
+  liquidityPairs: string[];
+  historicalLiquidityPairs?: string[];
+}
+
+interface WalletContextPayload {
+  walletAddress?: string;
+  chainId?: number;
+  balances: { symbol: string; formatted: string }[];
+  liquidityPairs: string[];
+}
+
 function genId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+function parseLooseAmount(raw: string | undefined, fallback: string): string {
+  if (!raw) return fallback;
+  const normalized = raw
+    .replace(/[oO](\d)/g, "0$1")
+    .replace(/(\d)[oO]/g, "$10")
+    .replace(/[^0-9.]/g, "");
+  return normalized || fallback;
+}
+
 const BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD";
+const SEEDED_BASELINE_LP = 10000n * 10n ** 18n;
 
 function draftKey(draft: TransactionDraft) {
   return `${draft.intent}:${draft.params?.protocol ?? ""}:${JSON.stringify(draft.params ?? {})}`;
@@ -61,13 +93,15 @@ const SIDEBAR_TABS = [
   { id: "portfolio", label: "Portfolio", icon: LayoutDashboard },
   { id: "history", label: "History", icon: Clock3 },
   { id: "points", label: "Points", icon: Trophy },
-  { id: "roadmap", label: "Roadmap", icon: Map },
+  { id: "roadmap", label: "Roadmap", icon: MapIcon },
   { id: "profile", label: "Profile", icon: User },
   { id: "admin", label: "Admin", icon: Shield },
 ] as const;
 
 const EXECUTABLE_INTENTS = new Set([
   "swap",
+  "addLiquidity",
+  "removeLiquidity",
   "bridge",
   "stake",
   "unstake",
@@ -80,6 +114,7 @@ const EXECUTABLE_INTENTS = new Set([
 
 export default function Index() {
   const { address, chainId } = useAccount();
+  const publicClient = usePublicClient();
   const conversationsStorageKey = useMemo(() => {
     const suffix = address ? address.toLowerCase() : "anon";
     return `defai.conversations.${suffix}`;
@@ -106,8 +141,34 @@ export default function Index() {
     lastHash: null,
   });
 
-  const { saveTransaction } = useTransactionHistory(address);
+  const { saveTransaction, transactions } = useTransactionHistory(address);
   const { balances, isLoading: balancesLoading, error: balancesError } = usePortfolioBalances(address as any);
+  // After await defai-agent, use latest balances — stale closure used to show "no swappable token" while portfolio had data.
+  const balancesRef = useRef(balances);
+  const balancesLoadingRef = useRef(balancesLoading);
+  useEffect(() => {
+    balancesRef.current = balances;
+  }, [balances]);
+  useEffect(() => {
+    balancesLoadingRef.current = balancesLoading;
+  }, [balancesLoading]);
+
+  // When users click quickly, the AI call can return before balances are finished loading.
+  // We wait briefly (without blocking the whole UI) and then recompute token options.
+  const waitForBalancesLoaded = useCallback(async (timeoutMs = 4500): Promise<boolean> => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (
+        !balancesLoadingRef.current &&
+        balancesRef.current.length > 1
+      ) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return !balancesLoadingRef.current;
+  }, []);
+
   const visibleConversations = useMemo(
     () =>
       conversations
@@ -115,6 +176,279 @@ export default function Index() {
         .sort((a, b) => b.updatedAt - a.updatedAt),
     [conversations]
   );
+
+  const myLiquidityPairOptions = useMemo(() => {
+    const pairs = new Set<string>();
+    // Use persisted wallet transaction history to infer pairs user actually touched.
+    for (const tx of transactions) {
+      if (tx.intent !== "addLiquidity" && tx.intent !== "removeLiquidity") continue;
+      const params = (tx.params || {}) as Record<string, unknown>;
+      const t0 = String(params.token0 || "").toUpperCase();
+      const t1 = String(params.token1 || "").toUpperCase();
+      if (!t0 || !t1) continue;
+      pairs.add(`${t0}/${t1}`);
+    }
+    return Array.from(pairs).sort();
+  }, [transactions]);
+  const [onchainLiquidityPairOptions, setOnchainLiquidityPairOptions] = useState<string[]>([]);
+
+  const readOnchainLiquidityPairs = useCallback(async (): Promise<string[]> => {
+    if (!publicClient || !address) return [];
+    try {
+      const entries = Object.entries(HUB_AMM_POOLS) as [string, Address][];
+      const lpReads: { pair: string; lpBalance: bigint }[] = [];
+      for (const [pair, pool] of entries) {
+        if (!pool || pool.toLowerCase() === "0x0000000000000000000000000000000000000000") continue;
+        try {
+          const lpBal = (await publicClient.readContract({
+            address: pool,
+            abi: ERC20_ABI,
+            functionName: "balanceOf",
+            args: [address],
+          } as any)) as bigint;
+          if (lpBal > 0n) lpReads.push({ pair: pair.toUpperCase(), lpBalance: lpBal });
+        } catch {
+          // skip problematic pools
+        }
+      }
+      const minNonZero = lpReads.reduce<bigint | null>((acc, r) => {
+        if (acc === null) return r.lpBalance;
+        return r.lpBalance < acc ? r.lpBalance : acc;
+      }, null);
+      const baselineLp = minNonZero !== null && minNonZero > 0n ? minNonZero : SEEDED_BASELINE_LP;
+
+      const pairs = lpReads.filter((r) => r.lpBalance > baselineLp).map((r) => r.pair);
+      return Array.from(new Set(pairs)).sort();
+    } catch {
+      return [];
+    }
+  }, [publicClient, address]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadOnchainLiquidityPairs() {
+      const pairs = await readOnchainLiquidityPairs();
+      if (!cancelled) setOnchainLiquidityPairOptions(pairs);
+    }
+    loadOnchainLiquidityPairs();
+    return () => {
+      cancelled = true;
+    };
+  }, [readOnchainLiquidityPairs]);
+
+  const effectiveLiquidityPairOptions = useMemo(() => {
+    if (onchainLiquidityPairOptions.length > 0) return onchainLiquidityPairOptions;
+    return myLiquidityPairOptions;
+  }, [onchainLiquidityPairOptions, myLiquidityPairOptions]);
+
+  const hasLiquidityKeyword = useCallback((command: string) => {
+    return /\b(lp|liquidity|liq[a-z]*)\b/i.test(command.toLowerCase());
+  }, []);
+
+  const canonicalTokenSymbol = useCallback((symbol?: string) => {
+    const upper = String(symbol || "")
+      .trim()
+      .replace(/^\$+/, "")
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .toUpperCase();
+    if (!upper) return "";
+    if (upper.startsWith("D")) {
+      const deprefixed = upper.slice(1);
+      if (HUB_TOKENS[deprefixed as keyof typeof HUB_TOKENS]) return deprefixed;
+    }
+    return upper;
+  }, []);
+
+  const addLiquidityPairOptions = useMemo(() => {
+    const balanceBySymbol = new Map<string, number>();
+    for (const b of balances) {
+      const sym = canonicalTokenSymbol(b.symbol);
+      const amount = Number(b.formatted);
+      if (!sym || !Number.isFinite(amount) || amount <= 0) continue;
+      balanceBySymbol.set(sym, amount);
+    }
+    const ranked = Object.keys(HUB_AMM_POOLS)
+      .map((pair) => {
+        const [a, b] = pair.toUpperCase().split("/");
+        const balA = balanceBySymbol.get(a) ?? 0;
+        const balB = balanceBySymbol.get(b) ?? 0;
+        return { pair: `${a}/${b}`, score: Math.min(balA, balB) };
+      })
+      .filter((x) => x.score > 0)
+      .sort((x, y) => y.score - x.score)
+      .map((x) => x.pair);
+    return Array.from(new Set(ranked));
+  }, [balances, canonicalTokenSymbol]);
+
+  const commandMentionsAddAmount = useCallback((command: string) => {
+    const lower = command.toLowerCase();
+    if (/(\d+(?:\.\d+)?)\s*%/i.test(lower)) return true;
+    return /(\d[\d.,oO]*)/i.test(lower);
+  }, []);
+
+  const commandMentionsAnyAmount = useCallback((command: string) => {
+    const lower = command.toLowerCase();
+    if (/\b(all|max|half)\b/i.test(lower)) return true;
+    if (/(\d+(?:\.\d+)?)\s*%/i.test(lower)) return true;
+    return /(\d[\d.,oO]*)/i.test(lower);
+  }, []);
+
+  const extractMentionedSymbols = useCallback((command: string) => {
+    const lower = command.toLowerCase();
+    return [...lower.matchAll(/\$?(usdc|usdt|domain|tcc|tcx|tch|pai|hlt|rwa|yield|infra|carb)\b/gi)]
+      .map((m) => canonicalTokenSymbol(m[1]))
+      .filter(Boolean);
+  }, [canonicalTokenSymbol]);
+
+  const getBalanceBySymbol = useCallback((symbolRaw?: string) => {
+    const symbol = canonicalTokenSymbol(symbolRaw);
+    if (!symbol) return 0;
+    const bal = balances.find((b) => canonicalTokenSymbol(b.symbol) === symbol);
+    const n = Number(bal?.formatted || "0");
+    return Number.isFinite(n) ? n : 0;
+  }, [balances, canonicalTokenSymbol]);
+
+  const getStakedAmountByToken = useCallback(
+    async (tokenSymbolRaw?: string): Promise<number> => {
+      const tokenSymbol = canonicalTokenSymbol(tokenSymbolRaw);
+      if (!tokenSymbol) return 0;
+      const vault = HUB_STAKING_VAULTS[tokenSymbol];
+      if (!vault || vault.toLowerCase() === "0x0000000000000000000000000000000000000000") return 0;
+      if (!publicClient || !address) return 0;
+
+      // Vault stores userInfo.amount in staking token units (raw), so we need decimals.
+      const stakingTokenAddr = (await publicClient.readContract({
+        address: vault,
+        abi: DEFAI_STAKING_VAULT_ABI,
+        functionName: "stakingToken",
+      } as any)) as Address;
+      const decimals = (await publicClient.readContract({
+        address: stakingTokenAddr,
+        abi: ERC20_ABI,
+        functionName: "decimals",
+      } as any)) as number;
+      const userInfo = (await publicClient.readContract({
+        address: vault,
+        abi: DEFAI_STAKING_VAULT_ABI,
+        functionName: "userInfo",
+        args: [address],
+      } as any)) as readonly [bigint, bigint, bigint];
+
+      // amount is staking token amount (raw)
+      const amtRaw = userInfo[0];
+      // Convert raw to human number
+      const amtHuman = Number(amtRaw) / 10 ** decimals;
+      return Number.isFinite(amtHuman) ? amtHuman : 0;
+    },
+    [address, balances, canonicalTokenSymbol, publicClient]
+  );
+
+  const tokenOptionsByBalance = useMemo(() => {
+    return balances
+      .map((b) => ({
+        symbol: canonicalTokenSymbol(b.symbol),
+        balance: Number(b.formatted),
+      }))
+      .filter((x) => x.symbol && Number.isFinite(x.balance) && x.balance > 0)
+      .sort((a, b) => b.balance - a.balance)
+      .map((x) => x.symbol);
+  }, [balances, canonicalTokenSymbol]);
+
+  const stakeableSymbolSet = useMemo(
+    () => new Set(HUB_STAKEABLE_SYMBOLS.map((s) => s.toUpperCase())),
+    []
+  );
+
+  const stakeableTokenOptions = useMemo(() => {
+    return tokenOptionsByBalance.filter((s) => stakeableSymbolSet.has(s));
+  }, [tokenOptionsByBalance, stakeableSymbolSet]);
+
+  const getUnstakeableTokenOptions = useCallback(async (): Promise<string[]> => {
+    const vaultTokens = Object.keys(HUB_STAKING_VAULTS).map((k) => canonicalTokenSymbol(k));
+    const unique = Array.from(new Set(vaultTokens)).filter(Boolean);
+    const out: string[] = [];
+    for (const t of unique) {
+      const staked = await getStakedAmountByToken(t);
+      if (Number.isFinite(staked) && staked > 0) out.push(t);
+    }
+    return out;
+  }, [canonicalTokenSymbol, getStakedAmountByToken]);
+
+  const getSwapCounterpartOptions = useCallback((fromTokenRaw?: string) => {
+    const from = canonicalTokenSymbol(fromTokenRaw);
+    if (!from) return [] as string[];
+    const out = new Set<string>();
+    for (const pair of Object.keys(HUB_AMM_POOLS)) {
+      const [a, b] = pair.toUpperCase().split("/");
+      if (a === from) out.add(b);
+      if (b === from) out.add(a);
+    }
+    return Array.from(out);
+  }, [canonicalTokenSymbol]);
+
+  /** Use after async (e.g. AI invoke) so options reflect balances that loaded during the round-trip. */
+  const computeSwapFromTokenOptions = useCallback(
+    (balanceRows: typeof balances) => {
+      const parseNum = (v: unknown) => {
+        const s = String(v ?? "");
+        return Number(s.replace(/,/g, ""));
+      };
+      const symbols = balanceRows
+        .map((b) => ({
+          symbol: canonicalTokenSymbol(b.symbol),
+          balance: parseNum(b.formatted),
+        }))
+        .filter((x) => x.symbol && Number.isFinite(x.balance) && x.balance > 0)
+        .sort((a, b) => b.balance - a.balance)
+        .map((x) => x.symbol);
+      return symbols.filter((s) => getSwapCounterpartOptions(s).length > 0);
+    },
+    [canonicalTokenSymbol, getSwapCounterpartOptions]
+  );
+
+  const computeStakeableTokenOptionsFromBalances = useCallback(
+    (balanceRows: typeof balances) => {
+      const parseNum = (v: unknown) => {
+        const s = String(v ?? "");
+        return Number(s.replace(/,/g, ""));
+      };
+      return balanceRows
+        .map((b) => ({
+          symbol: canonicalTokenSymbol(b.symbol),
+          balance: parseNum(b.formatted),
+        }))
+        .filter((x) => x.symbol && Number.isFinite(x.balance) && x.balance > 0)
+        .sort((a, b) => b.balance - a.balance)
+        .map((x) => x.symbol)
+        .filter((s) => stakeableSymbolSet.has(s));
+    },
+    [canonicalTokenSymbol, stakeableSymbolSet]
+  );
+
+  const getBalanceBySymbolFromRows = useCallback(
+    (balanceRows: typeof balances, symbolRaw?: string) => {
+      const symbol = canonicalTokenSymbol(symbolRaw);
+      if (!symbol) return 0;
+      const bal = balanceRows.find((b) => canonicalTokenSymbol(b.symbol) === symbol);
+      const n = Number(String(bal?.formatted || "0").replace(/,/g, ""));
+      return Number.isFinite(n) ? n : 0;
+    },
+    [canonicalTokenSymbol]
+  );
+
+  const commandMentionsPair = useCallback((command: string) => {
+    const lower = command.toLowerCase();
+    if (/\b[a-z]{2,10}\s*\/\s*[a-z]{2,10}\b/i.test(lower)) return true;
+    const symbols = [...lower.matchAll(/\$?(usdc|usdt|domain|tcc|tcx|tch|pai|hlt|rwa|yield|infra|carb)\b/gi)];
+    return symbols.length >= 2;
+  }, []);
+
+  const commandMentionsRemoveAmount = useCallback((command: string) => {
+    const lower = command.toLowerCase();
+    if (/\b(all|max)\b/i.test(lower)) return true;
+    if (/(\d+(?:\.\d+)?)\s*%/i.test(lower)) return true;
+    return /(\d[\d.,oO]*)/i.test(lower);
+  }, []);
 
   const pushAssistantMessage = useCallback((content: string) => {
     setMessages((prev) => [...prev, { id: genId(), role: "assistant", content }]);
@@ -144,12 +478,90 @@ export default function Index() {
     return fixed.replace(/\.?0+$/, "");
   }, []);
 
+  const buildAddLiquidityDraftFromPair = useCallback(
+    (token0Raw: string, token1Raw: string, source?: TransactionDraft, percentOfBalance?: number): TransactionDraft => {
+      const token0 = canonicalTokenSymbol(token0Raw);
+      const token1 = canonicalTokenSymbol(token1Raw);
+      const bal0 = Number(balances.find((b) => canonicalTokenSymbol(b.symbol) === token0)?.formatted || "0");
+      const bal1 = Number(balances.find((b) => canonicalTokenSymbol(b.symbol) === token1)?.formatted || "0");
+      const deriveSuggestedAmount = (balance: number) => {
+        if (!Number.isFinite(balance) || balance <= 0) return "";
+        const pct = Number.isFinite(percentOfBalance) ? Math.max(0, Math.min(100, Number(percentOfBalance))) : NaN;
+        const target = Number.isFinite(pct) ? (balance * pct) / 100 : balance >= 100 ? balance * 0.1 : balance * 0.25;
+        const clipped = Math.max(0, Math.min(balance, target));
+        const normalized = toCleanAmount(clipped);
+        if (Number(normalized) > 0) return normalized;
+        return toCleanAmount(balance);
+      };
+      const amount0 = deriveSuggestedAmount(bal0);
+      const amount1 = deriveSuggestedAmount(bal1);
+      const warnings = [...(source?.warnings || [])];
+      if (!amount0 || !amount1) {
+        warnings.push("Could not derive non-zero amounts from current balances. Specify explicit amounts before execution.");
+      } else {
+        if (Number.isFinite(percentOfBalance)) {
+          warnings.push(`Sized at ${Number(percentOfBalance)}% of wallet balances (${token0}: ${amount0}, ${token1}: ${amount1}).`);
+        } else {
+          warnings.push(`Suggested sizes derived from wallet balances (${token0}: ${amount0}, ${token1}: ${amount1}).`);
+        }
+      }
+
+      return {
+        intent: "addLiquidity",
+        summary: amount0 && amount1
+          ? `Add liquidity: ${amount0} ${token0} + ${amount1} ${token1}`
+          : `Add liquidity into ${token0}/${token1}`,
+        params: {
+          ...(source?.params || {}),
+          token0,
+          token1,
+          amount0,
+          amount1,
+          lpAmount: Number.isFinite(percentOfBalance) ? `${Number(percentOfBalance)}%` : (source?.params?.lpAmount || ""),
+          protocol: source?.params?.protocol || "DeFAI AMM Pool",
+        },
+        gasEstimate: source?.gasEstimate || "~0.001 DOT",
+        message: source?.message || "Prepared from wallet balance context.",
+        warnings: warnings.length ? warnings : undefined,
+      };
+    },
+    [balances, canonicalTokenSymbol, toCleanAmount]
+  );
+
+  const walletContext = useMemo<WalletContextPayload>(
+    () => ({
+      walletAddress: address,
+      chainId,
+      balances: balances.map((b) => ({ symbol: canonicalTokenSymbol(b.symbol), formatted: String(b.formatted) })),
+      liquidityPairs: onchainLiquidityPairOptions,
+      historicalLiquidityPairs: myLiquidityPairOptions,
+    }),
+    [address, chainId, balances, canonicalTokenSymbol, onchainLiquidityPairOptions, myLiquidityPairOptions]
+  );
+
   const buildPendingConfirmation = useCallback(
     (draft: TransactionDraft): PendingConfirmation => {
       const p = draft.params ?? {};
       let prompt = `I understood this action: ${draft.summary}. Proceed?`;
       if (draft.intent === "swap") {
         prompt = `You want to swap ${p.amount || "0"} ${p.fromToken || "USDC"} to ${p.toToken || "USDT"}. Proceed?`;
+      } else if (draft.intent === "addLiquidity") {
+        if (p.usdcEquivalentTotal) {
+          prompt = `You want to add liquidity with ${p.usdcEquivalentTotal} USDC equivalent total into ${p.token0 || "USDC"}/${p.token1 || "USDT"} (split 50/50 by value). Proceed?`;
+          const stableSymbols = new Set(["USDC", "USDT"]);
+          const t0 = (p.token0 || "").toUpperCase();
+          const t1 = (p.token1 || "").toUpperCase();
+          const hasStableSide = stableSymbols.has(t0) || stableSymbols.has(t1);
+          if (!hasStableSide) {
+            prompt += "\nNote: this pair has no USDC/USDT side. Confirm the quote basis before execution.";
+          }
+        } else {
+          prompt = `You want to add liquidity: ${p.amount0 || p.amount || "0"} ${p.token0 || "USDC"} + ${p.amount1 || "0"} ${p.token1 || "USDT"}. Proceed?`;
+        }
+      } else if (draft.intent === "removeLiquidity") {
+        const rawAmt = p.lpAmount || p.amount || "";
+        const amountLabel = rawAmt ? (String(rawAmt).includes("%") ? `${rawAmt}` : `${rawAmt} LP`) : "liquidity";
+        prompt = `You want to remove ${amountLabel} from ${p.token0 || "USDC"}/${p.token1 || "USDT"}. Proceed?`;
       } else if (draft.intent === "bridge") {
         prompt = `You want to bridge ${p.amount || "0"} ${p.token || "USDC"} from ${p.fromChain || "Polkadot Hub"} to ${p.toChain || "Base Sepolia"}. Proceed?`;
       } else if (draft.intent === "stake") {
@@ -189,6 +601,107 @@ export default function Index() {
     []
   );
 
+  const buildAddLiquiditySizeSelection = useCallback(
+    (draft: TransactionDraft, token0Raw: string, token1Raw: string): PendingConfirmation => {
+      const token0 = canonicalTokenSymbol(token0Raw) || "USDC";
+      const token1 = canonicalTokenSymbol(token1Raw) || "USDT";
+      return {
+        id: genId(),
+        draft: {
+          ...draft,
+          params: {
+            ...draft.params,
+            token0,
+            token1,
+          },
+        },
+        selectionField: "lpAmount",
+        options: ["10%", "25%", "50%", "75%", "100%"],
+        prompt: `How much of your wallet balance should I use for ${token0}/${token1} liquidity?`,
+        customInput: {
+          placeholder: `${token0}/${token1}: amount0,amount1 (e.g. 100,200) or a percent like 50%`,
+          submitLabel: "Use",
+        },
+      };
+    },
+    [canonicalTokenSymbol]
+  );
+
+  const buildAmountPercentSelection = useCallback(
+    (draft: TransactionDraft, tokenSymbolRaw: string, intentLabel: "swap" | "stake" | "unstake"): PendingConfirmation => {
+      const tokenSymbol = canonicalTokenSymbol(tokenSymbolRaw) || "USDC";
+      const basisType = draft.params.basisType;
+      const basisAmountRaw = draft.params.basisAmount;
+      const hasStakedBasis = intentLabel === "unstake" && basisType === "staked" && !!basisAmountRaw;
+
+      const balance =
+        hasStakedBasis ? Number(basisAmountRaw) : getBalanceBySymbol(tokenSymbol);
+      const balanceLabel = Number(balance).toLocaleString("en-US", { maximumFractionDigits: 6 });
+      const verb = intentLabel === "swap" ? "swap" : intentLabel === "stake" ? "stake" : "unstake";
+      const basisWord = hasStakedBasis ? "staked" : "wallet";
+      return {
+        id: genId(),
+        draft,
+        selectionField: "amount",
+        options: ["10%", "25%", "50%", "75%", "100%"],
+        prompt: `How much ${tokenSymbol} do you want to ${verb}? ${basisWord === "staked" ? "Staked" : "Wallet"} balance: ${balanceLabel} ${tokenSymbol}.`,
+        customInput: {
+          placeholder: `Custom amount, e.g. 123.45`,
+          submitLabel: "Use",
+        },
+      };
+    },
+    [canonicalTokenSymbol, getBalanceBySymbol]
+  );
+
+  const applyPercentAmountToDraft = useCallback(
+    (draft: TransactionDraft, percent: number): TransactionDraft => {
+      const p = Math.max(0, Math.min(100, percent));
+      const tokenSymbol =
+        draft.intent === "swap"
+          ? canonicalTokenSymbol(draft.params.fromToken || "USDC")
+          : canonicalTokenSymbol(draft.params.token || "USDC");
+
+      const basisAmountRaw = draft.params.basisAmount;
+      const basisType = draft.params.basisType;
+      const basisFromDraft = basisAmountRaw ? Number(basisAmountRaw) : NaN;
+      const balance =
+        basisType === "staked" && Number.isFinite(basisFromDraft) ? basisFromDraft : getBalanceBySymbol(tokenSymbol);
+
+      const amount = toCleanAmount((balance * p) / 100);
+      const warnings = [...(draft.warnings || [])];
+      const basisLabel = basisType === "staked" ? "staked" : "wallet";
+      warnings.push(`Derived amount from ${p}% of current ${basisLabel} ${tokenSymbol} balance.`);
+
+      if (draft.intent === "swap") {
+        return {
+          ...draft,
+          summary: `Swap ${amount} ${tokenSymbol} to ${draft.params.toToken || "USDT"}`,
+          params: { ...draft.params, amount, fromToken: tokenSymbol },
+          warnings,
+        };
+      }
+      if (draft.intent === "stake") {
+        return {
+          ...draft,
+          summary: `Stake ${amount} ${tokenSymbol}`,
+          params: { ...draft.params, amount, token: tokenSymbol },
+          warnings,
+        };
+      }
+      if (draft.intent === "unstake") {
+        return {
+          ...draft,
+          summary: `Unstake ${amount} ${tokenSymbol}`,
+          params: { ...draft.params, amount, token: tokenSymbol },
+          warnings,
+        };
+      }
+      return draft;
+    },
+    [canonicalTokenSymbol, getBalanceBySymbol, toCleanAmount]
+  );
+
   const buildTickerDisambiguation = useCallback(
     (draft: TransactionDraft, field: "toToken" | "token"): PendingConfirmation => {
       return {
@@ -206,6 +719,11 @@ export default function Index() {
   const buildUnstructuredDraft = useCallback(
     (command: string): PendingConfirmation | null => {
       const lower = command.toLowerCase();
+      const hasLiquidityWord = hasLiquidityKeyword(lower);
+      const isAddLiquidityPhrase =
+        hasLiquidityWord &&
+        (/\b(add|provide|deposit)\b/i.test(lower) || /\bpair\b|\/|paired|equivalent|pool\b/i.test(lower));
+      const isRemoveLiquidityPhrase = hasLiquidityWord && /\b(remove|withdraw|exit)\b/i.test(lower);
       const launchTokenRequested =
         /\b(create|deploy|launch)\b[\w\s]{0,20}\btoken\b/i.test(command) ||
         /\btoken\s*(name|ticker|symbol)\b/i.test(command) ||
@@ -215,7 +733,7 @@ export default function Index() {
       const token = (tokenMatch?.[1] || "USDC").toUpperCase();
       const pctMatch = lower.match(/(\d+(?:\.\d+)?)\s*%/);
       const amountMatch = lower.match(/(\d+(?:\.\d+)?)/);
-      const tokenBalance = balances.find((b) => b.symbol.toUpperCase() === token);
+      const tokenBalance = balances.find((b) => canonicalTokenSymbol(b.symbol) === token);
       const balanceNum = tokenBalance ? Number(tokenBalance.formatted) : NaN;
 
       const resolveAmount = (fallback: number) => {
@@ -264,6 +782,74 @@ export default function Index() {
           message: "Prepared from your unstructured prompt.",
           warnings: warning ? [warning] : undefined,
         };
+      } else if (isAddLiquidityPhrase) {
+        const looseAmounts = [...command.matchAll(/(\d[\d.,oO]*)/g)].map((m) => parseLooseAmount(m[1], "0"));
+        const hasPercentSizing = !!pctMatch;
+        const hasExplicitAmounts = looseAmounts.length > 0 && !hasPercentSizing;
+        const amountA = looseAmounts[0] || "";
+        const amountB = looseAmounts[1] || amountA || "";
+        const hasEquivalentMode = /\bequivalent\b|\beqv\b|\bvalue\b/i.test(lower);
+        const symbols = [...lower.matchAll(/\$?(usdc|usdt|domain|tcc|tcx|tch|pai|hlt|rwa|yield|infra|carb)\b/gi)].map((m) =>
+          m[1].toUpperCase()
+        );
+        const [suggested0, suggested1] = (addLiquidityPairOptions[0] || "USDC/USDT").split("/");
+        const token0 = symbols[0] || suggested0 || "USDC";
+        const token1 = symbols[1] || suggested1 || (token0 === "USDC" ? "USDT" : "USDC");
+        const totalEquivalent = hasEquivalentMode && looseAmounts.length === 1 ? amountA || "0" : undefined;
+        const halfEquivalent = totalEquivalent ? toCleanAmount(Number(totalEquivalent) / 2) : undefined;
+        const stableSymbols = new Set(["USDC", "USDT"]);
+        const hasStableSide = stableSymbols.has(token0) || stableSymbols.has(token1);
+        const baseAddDraft: TransactionDraft = {
+          intent: "addLiquidity",
+          summary: totalEquivalent
+            ? `Add liquidity (${totalEquivalent} USDC equivalent total) into ${token0}/${token1}`
+            : `Add liquidity into ${token0}/${token1}`,
+          params: totalEquivalent
+            ? {
+                usdcEquivalentTotal: totalEquivalent,
+                amount0: halfEquivalent || amountA || "",
+                amount1: halfEquivalent || amountA || "",
+                token0,
+                token1,
+                protocol: "DeFAI AMM Pool",
+              }
+            : { amount0: amountA, amount1: amountB, token0, token1, protocol: "DeFAI AMM Pool" },
+          gasEstimate: "~0.001 DOT",
+          message: "Prepared from your unstructured prompt.",
+          warnings:
+            totalEquivalent && !hasStableSide
+              ? ["USDC-equivalent mode is most reliable when one side is USDC/USDT. This pair has no stable side; review quote basis."]
+              : undefined,
+        };
+        draft = hasExplicitAmounts || totalEquivalent
+          ? baseAddDraft
+          : hasPercentSizing
+            ? buildAddLiquidityDraftFromPair(token0, token1, baseAddDraft, Math.min(Number(pctMatch?.[1] || "0"), 100))
+            : baseAddDraft;
+      } else if (isRemoveLiquidityPhrase) {
+        const pctMatchLocal = lower.match(/(\d+(?:\.\d+)?)\s*%/);
+        const hasMax = /\b(all|max)\b/i.test(lower);
+        const lpAmount = hasMax
+          ? "100%"
+          : pctMatchLocal
+            ? `${pctMatchLocal[1]}%`
+            : amountMatch
+              ? parseLooseAmount(amountMatch[1], "0")
+              : "";
+        const symbols = [...lower.matchAll(/\$?(usdc|usdt|domain|tcc|tcx|tch|pai|hlt|rwa|yield|infra|carb)\b/gi)].map((m) =>
+          m[1].toUpperCase()
+        );
+        const token0 = symbols[0];
+        const token1 = symbols[1];
+        draft = {
+          intent: "removeLiquidity",
+          summary: lpAmount
+            ? `Remove liquidity: ${lpAmount}${lpAmount.includes("%") ? "" : " LP"}`
+            : "Remove liquidity",
+          params: { lpAmount, token0, token1, protocol: "DeFAI AMM Pool" },
+          gasEstimate: "~0.001 DOT",
+          message: "Prepared from your unstructured prompt.",
+        };
       } else if (/\bswa[a-z\[\]]*|\bexchange\b/i.test(lower)) {
         const ambiguousTwinchain =
           lower.includes("twinchain credit") && !/\b(tcc|tcx|tch)\b/i.test(lower);
@@ -275,7 +861,7 @@ export default function Index() {
           ? "TCC"
           : tokenSymbols[1] || (fromToken === "USDC" ? "USDT" : "USDC");
         if (fromToken === toToken) toToken = fromToken === "USDC" ? "USDT" : "USDC";
-        const fromBal = balances.find((b) => b.symbol.toUpperCase() === fromToken);
+        const fromBal = balances.find((b) => canonicalTokenSymbol(b.symbol) === fromToken);
         const fromBalNum = fromBal ? Number(fromBal.formatted) : NaN;
         let amount = amountMatch?.[1] || "10";
         let warning: string | undefined;
@@ -287,7 +873,7 @@ export default function Index() {
         draft = {
           intent: "swap",
           summary: `Swap ${amount} ${fromToken} to ${toToken}`,
-          params: { amount, fromToken, toToken, protocol: "DeFAISimpleSwap", slippage: "0.5%" },
+          params: { amount, fromToken, toToken, protocol: "DeFAI AMM Pool", slippage: "0.5%" },
           gasEstimate: "~0.001 DOT",
           message: "Prepared from your unstructured prompt.",
           warnings: warning ? [warning] : undefined,
@@ -417,7 +1003,16 @@ export default function Index() {
       if (!draft) return null;
       return buildPendingConfirmation(draft);
     },
-    [address, balances, toCleanAmount, buildPendingConfirmation, buildTickerDisambiguation]
+    [
+      addLiquidityPairOptions,
+      balances,
+      buildAddLiquidityDraftFromPair,
+      buildPendingConfirmation,
+      buildTickerDisambiguation,
+      canonicalTokenSymbol,
+      hasLiquidityKeyword,
+      toCleanAmount,
+    ]
   );
 
   const handleNewChat = useCallback(() => {
@@ -652,35 +1247,7 @@ export default function Index() {
       return;
     }
 
-    const isSimpleCommand = (() => {
-      const t = command.trim();
-      const lower = t.toLowerCase();
-      if (t.length === 0) return false;
-      // If user is clearly asking multi-step or giving context, prefer AI.
-      if (/\b(and then|then|after that|also|because|so that)\b/i.test(lower)) return false;
-      if (/\bi have\b|\bmy (wallet|balance)\b|\buse (half|50%)\b/i.test(lower)) return false;
-
-      // Fast-path simple action phrases.
-      const simpleIntentHit =
-        /\bbridge\b/i.test(lower) ||
-        /\bstake\b/i.test(lower) ||
-        /\bunstake\b/i.test(lower) ||
-        /\bclaim\b/i.test(lower) ||
-        /\bnft\b|\bmint\b/i.test(lower) ||
-        /\bswap\b|\bexchange\b|\bswa[\w\[\]]*\b/i.test(lower) ||
-        (/\b(create|deploy|launch)\b/i.test(lower) && /\btoken\b/i.test(lower));
-
-      return simpleIntentHit && t.length <= 160;
-    })();
-
-    if (isSimpleCommand) {
-      const unstructuredDraft = buildUnstructuredDraft(command);
-      if (unstructuredDraft) {
-        setPendingConfirmation(unstructuredDraft);
-        return;
-      }
-    }
-
+    // DeFi intents always go through defai-agent first (demo / judge visibility). Local parser only on invoke failure.
     setIsProcessing(true);
 
     try {
@@ -688,17 +1255,19 @@ export default function Index() {
         .slice(-20)
         .map((m) => ({ role: m.role, content: m.content }));
       const { data, error } = await supabase.functions.invoke("defai-agent", {
-        body: { command, history },
+        body: { command, history, walletContext },
       });
 
       if (error) {
         console.error("Edge function error:", error);
-        // Fallback: if AI fails, try local parser for simple intents.
         const fallbackDraft = buildUnstructuredDraft(command);
         if (fallbackDraft) {
+          pushAssistantMessage(
+            "DeFAI agent could not be reached — using offline intent parser for this command only."
+          );
           setPendingConfirmation(fallbackDraft);
         } else {
-          const errContent = "Failed to process command. Please try again.";
+          const errContent = "DeFAI agent unavailable and the command could not be parsed offline. Please try again.";
           pushAssistantMessage(errContent);
           toast.error(errContent);
         }
@@ -715,6 +1284,9 @@ export default function Index() {
               : data.error;
         const fallbackDraft = buildUnstructuredDraft(command);
         if (fallbackDraft) {
+          pushAssistantMessage(
+            `${errContent} Using offline intent parser for this command only.`
+          );
           setPendingConfirmation(fallbackDraft);
         } else {
           pushAssistantMessage(errContent);
@@ -745,6 +1317,300 @@ export default function Index() {
       }
 
       if (EXECUTABLE_INTENTS.has(draft.intent)) {
+        if (draft.intent === "addLiquidity" && !commandMentionsPair(command)) {
+          if (addLiquidityPairOptions.length > 1) {
+            setPendingConfirmation({
+              id: genId(),
+              draft,
+              selectionField: "liquidityPair",
+              options: addLiquidityPairOptions,
+              prompt: `Which pair do you want to add liquidity to?\n${addLiquidityPairOptions.join(", ")}`,
+            });
+            return;
+          }
+          if (addLiquidityPairOptions.length === 1) {
+            const [t0, t1] = addLiquidityPairOptions[0].split("/");
+            setPendingConfirmation(buildAddLiquiditySizeSelection(draft, t0, t1));
+            return;
+          }
+        }
+        if (draft.intent === "addLiquidity" && !commandMentionsAddAmount(command)) {
+          setPendingConfirmation(
+            buildAddLiquiditySizeSelection(draft, draft.params.token0 || "USDC", draft.params.token1 || "USDT")
+          );
+          return;
+        }
+        if (draft.intent === "stake" || draft.intent === "unstake") {
+          const mentioned = extractMentionedSymbols(command);
+          const intentLabel = draft.intent === "stake" ? "stake" : "unstake";
+          const stakeTickerMentioned = mentioned.filter((s) => stakeableSymbolSet.has(s));
+
+          // No stake ticker in user text — ignore model default (edge fn used to force USDC).
+          if (stakeTickerMentioned.length === 0) {
+            const clearedDraft: TransactionDraft = { ...draft, params: { ...draft.params } };
+            delete clearedDraft.params.token;
+            delete clearedDraft.params.amount;
+
+            if (intentLabel === "unstake") {
+              const unstakeable = await getUnstakeableTokenOptions();
+              if (unstakeable.length === 0) {
+                pushAssistantMessage("No staked balance found to unstake.");
+                return;
+              }
+              const lines = await Promise.all(
+                unstakeable.map(async (t) => {
+                  const st = await getStakedAmountByToken(t);
+                  return `• ${t}: ${toCleanAmount(st)} staked`;
+                })
+              );
+              setPendingConfirmation({
+                id: genId(),
+                draft: clearedDraft,
+                selectionField: "token",
+                options: unstakeable,
+                prompt: `Which asset do you want to unstake?\n${lines.join("\n")}`,
+              });
+              return;
+            }
+
+            const latestStakeable = computeStakeableTokenOptionsFromBalances(balancesRef.current);
+            if (latestStakeable.length === 0) {
+              if (balancesLoadingRef.current) {
+                await waitForBalancesLoaded();
+              }
+              const latestStakeableAfter = computeStakeableTokenOptionsFromBalances(balancesRef.current);
+              if (latestStakeableAfter.length > 0) {
+                const lines = latestStakeableAfter.map(
+                  (t) => `• ${t}: ${toCleanAmount(getBalanceBySymbolFromRows(balancesRef.current, t))} in wallet`
+                );
+                setPendingConfirmation({
+                  id: genId(),
+                  draft: clearedDraft,
+                  selectionField: "token",
+                  options: latestStakeableAfter,
+                  prompt: `Which asset do you want to stake? (vault-supported tokens)\n${lines.join("\n")}`,
+                });
+                return;
+              }
+              pushAssistantMessage(
+                "No stake-eligible asset with non-zero wallet balance. Fund one of the hub demo tokens that has a vault (USDC, USDT, DOMAIN, TCC, TCX, TCH, PAI, HLT, RWA, YIELD, INFRA, CARB)."
+              );
+              return;
+            }
+            const lines = latestStakeable.map(
+              (t) => `• ${t}: ${toCleanAmount(getBalanceBySymbolFromRows(balancesRef.current, t))} in wallet`
+            );
+            setPendingConfirmation({
+              id: genId(),
+              draft: clearedDraft,
+              selectionField: "token",
+              options: latestStakeable,
+              prompt: `Which asset do you want to stake? (vault-supported tokens)\n${lines.join("\n")}`,
+            });
+            return;
+          }
+
+          const token = canonicalTokenSymbol(stakeTickerMentioned[0] || draft.params.token || "USDC");
+
+          if (intentLabel === "stake" && !computeStakeableTokenOptionsFromBalances(balancesRef.current).includes(token)) {
+            pushAssistantMessage(
+              `No ${token} balance to stake (or no staking vault for that asset on this network).`
+            );
+            return;
+          }
+
+          if (!commandMentionsAnyAmount(command)) {
+            if (intentLabel === "unstake") {
+              const staked = await getStakedAmountByToken(token);
+              const walletBal = getBalanceBySymbol(token);
+              if (!Number.isFinite(staked) || staked <= 0) {
+                pushAssistantMessage(`You have no staked ${token} balance to unstake.`);
+                return;
+              }
+              const basisAmount = toCleanAmount(staked);
+              setPendingConfirmation({
+                id: genId(),
+                draft: {
+                  ...draft,
+                  params: {
+                    ...draft.params,
+                    token,
+                    basisAmount,
+                    basisType: "staked",
+                  },
+                },
+                selectionField: "amount",
+                options: ["10%", "25%", "50%", "75%", "100%"],
+                prompt: `How much ${token} staked balance do you want to unstake?\nStaked balance: ${toCleanAmount(
+                  staked
+                )} ${token}. Wallet balance: ${toCleanAmount(walletBal)} ${token}.`,
+              });
+              return;
+            }
+
+            setPendingConfirmation(
+              buildAmountPercentSelection({ ...draft, params: { ...draft.params, token } }, token, intentLabel)
+            );
+            return;
+          }
+        }
+        if (draft.intent === "swap") {
+          const mentioned = extractMentionedSymbols(command);
+          // User didn’t name tickers — ignore model defaults (edge fn used to force USDC) and pick from wallet.
+          if (mentioned.length === 0) {
+            const clearedDraft: TransactionDraft = { ...draft, params: { ...draft.params } };
+            delete clearedDraft.params.fromToken;
+            delete clearedDraft.params.toToken;
+            delete clearedDraft.params.amount;
+            const fromOptions = computeSwapFromTokenOptions(balancesRef.current);
+            if (fromOptions.length === 0) {
+              if (balancesLoadingRef.current) {
+                await waitForBalancesLoaded();
+              }
+              const fromOptionsAfter = computeSwapFromTokenOptions(balancesRef.current);
+              if (fromOptionsAfter.length > 0) {
+                setPendingConfirmation({
+                  id: genId(),
+                  draft: clearedDraft,
+                  selectionField: "fromToken",
+                  options: fromOptionsAfter,
+                  prompt: "Which token do you want to swap from?",
+                });
+                return;
+              }
+              pushAssistantMessage(
+                "No swappable token with non-zero wallet balance found. You need a hub token that has an AMM pair (e.g. USDC, USDT, DOMAIN, TCC…) — native DOT is not routed through the demo pools."
+              );
+              return;
+            }
+            setPendingConfirmation({
+              id: genId(),
+              draft: clearedDraft,
+              selectionField: "fromToken",
+              options: fromOptions,
+              prompt: "Which token do you want to swap from?",
+            });
+            return;
+          }
+          const fromToken = canonicalTokenSymbol(draft.params.fromToken || mentioned[0] || "");
+          const toToken = canonicalTokenSymbol(draft.params.toToken || mentioned[1] || "");
+          if ((mentioned.length === 1 && !draft.params.toToken) || (fromToken && !toToken)) {
+            const toOptions = getSwapCounterpartOptions(fromToken).filter((s) => s !== fromToken);
+            if (toOptions.length > 0) {
+              setPendingConfirmation({
+                id: genId(),
+                draft: { ...draft, params: { ...draft.params, fromToken } },
+                selectionField: "toToken",
+                options: toOptions,
+                prompt: `Which token do you want to receive for ${fromToken}?`,
+              });
+              return;
+            }
+          }
+          if (!commandMentionsAnyAmount(command)) {
+            setPendingConfirmation(
+              buildAmountPercentSelection(
+                { ...draft, params: { ...draft.params, fromToken, toToken } },
+                fromToken || "USDC",
+                "swap"
+              )
+            );
+            return;
+          }
+        }
+        if (draft.intent === "removeLiquidity" && draft.params.requiresPair === "true") {
+          const pairs = (draft.params.availablePairs || "")
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean);
+          if (pairs.length > 0) {
+            setPendingConfirmation({
+              id: genId(),
+              draft,
+              selectionField: "liquidityPair",
+              options: pairs,
+              prompt: draft.message || `Which pair should I remove from?\n${pairs.join(", ")}`,
+            });
+          } else {
+            pushAssistantMessage(draft.message || "I could not find a removable liquidity pair for this wallet.");
+          }
+          return;
+        }
+        if (draft.intent === "removeLiquidity" && draft.params.requiresAmount === "true") {
+          const pairLabel =
+            draft.params.token0 && draft.params.token1
+              ? `${draft.params.token0}/${draft.params.token1}`
+              : "";
+          const options = (draft.params.suggestedPercents || "25%,50%,75%,100%")
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean);
+          setPendingConfirmation({
+            id: genId(),
+            draft,
+            selectionField: "lpAmount",
+            options,
+            prompt: draft.message || (pairLabel
+              ? `How much liquidity should I remove from ${pairLabel}?`
+              : "How much liquidity should I remove?"),
+            customInput: {
+              placeholder: "Custom LP amount (e.g. 10, 25%, max)",
+              submitLabel: "Use",
+            },
+          });
+          return;
+        }
+        if (draft.intent === "removeLiquidity" && !commandMentionsPair(command)) {
+          if (effectiveLiquidityPairOptions.length > 1) {
+            setPendingConfirmation({
+              id: genId(),
+              draft,
+              selectionField: "liquidityPair",
+              options: effectiveLiquidityPairOptions,
+              prompt: `You have multiple liquidity positions. Which pair should I remove from?\n${effectiveLiquidityPairOptions.join(", ")}`,
+            });
+            return;
+          }
+          if (effectiveLiquidityPairOptions.length === 1) {
+            const [t0, t1] = effectiveLiquidityPairOptions[0].split("/");
+            const nextDraft: TransactionDraft = {
+              ...draft,
+              params: { ...draft.params, token0: t0, token1: t1 },
+            };
+            if (!commandMentionsRemoveAmount(command)) {
+              setPendingConfirmation({
+                id: genId(),
+                draft: nextDraft,
+                selectionField: "lpAmount",
+                options: ["25%", "50%", "75%", "100%"],
+                prompt: "How much liquidity should I remove?",
+                customInput: {
+                  placeholder: "Custom LP amount (e.g. 10, 25%, max)",
+                  submitLabel: "Use",
+                },
+              });
+              return;
+            }
+            setPendingConfirmation(buildPendingConfirmation(nextDraft));
+            return;
+          }
+          pushAssistantMessage("No removable liquidity position found yet for this wallet.");
+          return;
+        }
+        if (draft.intent === "removeLiquidity" && !commandMentionsRemoveAmount(command)) {
+          setPendingConfirmation({
+            id: genId(),
+            draft,
+            selectionField: "lpAmount",
+            options: ["25%", "50%", "75%", "100%"],
+            prompt: "How much liquidity should I remove?",
+            customInput: {
+              placeholder: "Custom LP amount (e.g. 10, 25%, max)",
+              submitLabel: "Use",
+            },
+          });
+          return;
+        }
         if (needsTwinchainSelection) {
           const field = draft.intent === "swap" ? "toToken" : "token";
           setPendingConfirmation(buildTickerDisambiguation(draft, field));
@@ -772,12 +1638,40 @@ export default function Index() {
     }
   }, [
     activeConversationId,
+    addLiquidityPairOptions,
+    address,
+    balancesError,
+    balancesLoading,
+    buildAddLiquidityDraftFromPair,
+    buildAddLiquiditySizeSelection,
     formatBalancesMessage,
     pushAssistantMessage,
     buildUnstructuredDraft,
     buildPendingConfirmation,
     buildTickerDisambiguation,
+    buildAmountPercentSelection,
+    commandMentionsAddAmount,
+    commandMentionsAnyAmount,
+    commandMentionsPair,
+    commandMentionsRemoveAmount,
+    extractMentionedSymbols,
+    canonicalTokenSymbol,
+    tokenOptionsByBalance,
+    stakeableTokenOptions,
+    getUnstakeableTokenOptions,
+    getSwapCounterpartOptions,
+    computeSwapFromTokenOptions,
+    computeStakeableTokenOptionsFromBalances,
+    getBalanceBySymbolFromRows,
+    effectiveLiquidityPairOptions,
+    onchainLiquidityPairOptions,
+    readOnchainLiquidityPairs,
+    walletContext,
     messages,
+    getBalanceBySymbol,
+    getStakedAmountByToken,
+    toCleanAmount,
+    stakeableSymbolSet,
   ]);
 
   const handleConfirmYes = useCallback(() => {
@@ -795,15 +1689,138 @@ export default function Index() {
   }, [pendingConfirmation, pushAssistantMessage]);
 
   const handleSelectOption = useCallback(
-    (option: string) => {
+    async (option: string) => {
       if (!pendingConfirmation?.selectionField) return;
-      const nextDraft: TransactionDraft = {
-        ...pendingConfirmation.draft,
-        params: {
-          ...pendingConfirmation.draft.params,
-          [pendingConfirmation.selectionField]: option,
-        },
-      };
+      let nextDraft: TransactionDraft;
+      if (pendingConfirmation.selectionField === "liquidityPair") {
+        const [token0, token1] = option.toUpperCase().split("/");
+        nextDraft = {
+          ...pendingConfirmation.draft,
+          params: {
+            ...pendingConfirmation.draft.params,
+            token0: token0 || pendingConfirmation.draft.params.token0,
+            token1: token1 || pendingConfirmation.draft.params.token1,
+          },
+        };
+        if (pendingConfirmation.draft.intent === "addLiquidity") {
+          setPendingConfirmation(
+            buildAddLiquiditySizeSelection(
+              nextDraft,
+              nextDraft.params.token0 || token0 || "USDC",
+              nextDraft.params.token1 || token1 || "USDT"
+            )
+          );
+          return;
+        }
+        if (pendingConfirmation.draft.intent === "removeLiquidity" && pendingConfirmation.draft.params.requiresAmount === "true") {
+          const options = (pendingConfirmation.draft.params.suggestedPercents || "25%,50%,75%,100%")
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean);
+          setPendingConfirmation({
+            id: genId(),
+            draft: nextDraft,
+            selectionField: "lpAmount",
+            options,
+            prompt: nextDraft.message || "How much liquidity should I remove?",
+          });
+          return;
+        }
+      } else {
+        if (pendingConfirmation.selectionField === "fromToken" && pendingConfirmation.draft.intent === "swap") {
+          const fromToken = canonicalTokenSymbol(option);
+          const toOptions = getSwapCounterpartOptions(fromToken).filter((s) => s !== fromToken);
+          const next = {
+            ...pendingConfirmation.draft,
+            params: { ...pendingConfirmation.draft.params, fromToken },
+          };
+          if (toOptions.length > 0) {
+            setPendingConfirmation({
+              id: genId(),
+              draft: next,
+              selectionField: "toToken",
+              options: toOptions,
+              prompt: `Which token do you want to receive for ${fromToken}?`,
+            });
+            return;
+          }
+          setPendingConfirmation(buildAmountPercentSelection(next, fromToken, "swap"));
+          return;
+        }
+        if (pendingConfirmation.selectionField === "toToken" && pendingConfirmation.draft.intent === "swap") {
+          const next = {
+            ...pendingConfirmation.draft,
+            params: { ...pendingConfirmation.draft.params, toToken: canonicalTokenSymbol(option) },
+          };
+          setPendingConfirmation(buildAmountPercentSelection(next, next.params.fromToken || "USDC", "swap"));
+          return;
+        }
+        if (pendingConfirmation.selectionField === "token" && pendingConfirmation.draft.intent === "stake") {
+          const token = canonicalTokenSymbol(option);
+          const next = {
+            ...pendingConfirmation.draft,
+            params: { ...pendingConfirmation.draft.params, token },
+          };
+          setPendingConfirmation(buildAmountPercentSelection(next, token, "stake"));
+          return;
+        }
+        if (pendingConfirmation.selectionField === "token" && pendingConfirmation.draft.intent === "unstake") {
+          const token = canonicalTokenSymbol(option);
+          const staked = await getStakedAmountByToken(token);
+          if (!Number.isFinite(staked) || staked <= 0) {
+            pushAssistantMessage(`You have no staked ${token} balance to unstake.`);
+            return;
+          }
+          const basisAmount = toCleanAmount(staked);
+          setPendingConfirmation({
+            id: genId(),
+            draft: {
+              ...pendingConfirmation.draft,
+              params: {
+                ...pendingConfirmation.draft.params,
+                token,
+                basisAmount,
+                basisType: "staked",
+              },
+            },
+            selectionField: "amount",
+            options: ["10%", "25%", "50%", "75%", "100%"],
+            prompt: `How much ${token} staked balance do you want to unstake?\nStaked balance: ${basisAmount} ${token}.`,
+          });
+          return;
+        }
+        if (pendingConfirmation.selectionField === "lpAmount" && pendingConfirmation.draft.intent === "addLiquidity") {
+          const pctRaw = option.toLowerCase().includes("max")
+            ? "100"
+            : String(option).replace(/[^0-9.]/g, "");
+          const pct = Math.max(0, Math.min(100, Number(pctRaw || "0")));
+          const token0 = pendingConfirmation.draft.params.token0 || "USDC";
+          const token1 = pendingConfirmation.draft.params.token1 || "USDT";
+          const sizedDraft = buildAddLiquidityDraftFromPair(token0, token1, pendingConfirmation.draft, pct);
+          setPendingConfirmation(buildPendingConfirmation(sizedDraft));
+          return;
+        }
+        if (pendingConfirmation.selectionField === "amount" && (
+          pendingConfirmation.draft.intent === "swap" ||
+          pendingConfirmation.draft.intent === "stake" ||
+          pendingConfirmation.draft.intent === "unstake"
+        )) {
+          const pctRaw = option.toLowerCase().includes("max")
+            ? "100"
+            : String(option).replace(/[^0-9.]/g, "");
+          const pct = Math.max(0, Math.min(100, Number(pctRaw || "0")));
+          const sizedDraft = applyPercentAmountToDraft(pendingConfirmation.draft, pct);
+          setPendingConfirmation(buildPendingConfirmation(sizedDraft));
+          return;
+        }
+        nextDraft = {
+          ...pendingConfirmation.draft,
+          params: {
+            ...pendingConfirmation.draft.params,
+            [pendingConfirmation.selectionField]: option,
+          },
+        };
+      }
       setActions((prev) => {
         const incomingKey = draftKey(nextDraft);
         const exists = prev.some((a) => draftKey(a.draft) === incomingKey);
@@ -813,7 +1830,123 @@ export default function Index() {
       pushAssistantMessage(`Selected ${option}. I prepared the action — click \`Sign & Execute\` to proceed.`);
       setPendingConfirmation(null);
     },
-    [pendingConfirmation, pushAssistantMessage]
+    [
+      applyPercentAmountToDraft,
+      buildAddLiquidityDraftFromPair,
+      buildAddLiquiditySizeSelection,
+      buildAmountPercentSelection,
+      buildPendingConfirmation,
+      canonicalTokenSymbol,
+      getSwapCounterpartOptions,
+      getStakedAmountByToken,
+      pendingConfirmation,
+      pushAssistantMessage,
+      toCleanAmount,
+    ]
+  );
+
+  const handleCustomInputSubmit = useCallback(
+    (value: string) => {
+      if (!pendingConfirmation?.selectionField) return;
+      const raw = value.trim();
+      if (!raw) return;
+
+      const numericMatches = raw.replace(/,/g, "").match(/(\d+(?:\.\d+)?)/g) || [];
+      const firstNumber = numericMatches[0];
+
+      // Helper: create amount draft for swap/stake/unstake
+      const setAmountAndConfirm = (amountRaw: string) => {
+        const amount = toCleanAmount(Number(amountRaw));
+        const nextDraft: TransactionDraft = {
+          ...pendingConfirmation.draft,
+          params: {
+            ...pendingConfirmation.draft.params,
+            amount,
+          },
+        };
+        setPendingConfirmation(buildPendingConfirmation(nextDraft));
+      };
+
+      if (pendingConfirmation.selectionField === "amount") {
+        if (!firstNumber) {
+          pushAssistantMessage("Please enter a numeric amount.");
+          return;
+        }
+        if (pendingConfirmation.draft.intent === "swap") {
+          setAmountAndConfirm(firstNumber);
+          return;
+        }
+        if (pendingConfirmation.draft.intent === "stake" || pendingConfirmation.draft.intent === "unstake") {
+          setAmountAndConfirm(firstNumber);
+          return;
+        }
+      }
+
+      if (pendingConfirmation.selectionField === "lpAmount") {
+        if (pendingConfirmation.draft.intent === "removeLiquidity") {
+          const lpInput = raw;
+          const nextDraft: TransactionDraft = {
+            ...pendingConfirmation.draft,
+            params: {
+              ...pendingConfirmation.draft.params,
+              lpAmount: lpInput,
+            },
+          };
+          setActions((prev) => {
+            const incomingKey = draftKey(nextDraft);
+            const exists = prev.some((a) => draftKey(a.draft) === incomingKey);
+            if (exists) return prev;
+            return [{ id: Date.now().toString(), draft: nextDraft }, ...prev];
+          });
+          pushAssistantMessage(`Prepared remove liquidity with ${lpInput}. Click \`Sign & Execute\` to proceed.`);
+          setPendingConfirmation(null);
+          return;
+        }
+
+        if (pendingConfirmation.draft.intent === "addLiquidity") {
+          const token0 = pendingConfirmation.draft.params.token0 || "USDC";
+          const token1 = pendingConfirmation.draft.params.token1 || "USDT";
+
+          if (raw.includes("%")) {
+            const pct = numericMatches.length ? Number(numericMatches[0]) : NaN;
+            if (!Number.isFinite(pct) || pct <= 0) {
+              pushAssistantMessage("LP amount percent must be a number > 0 (e.g. 50%).");
+              return;
+            }
+            const sizedDraft = buildAddLiquidityDraftFromPair(token0, token1, pendingConfirmation.draft, pct);
+            setPendingConfirmation(buildPendingConfirmation(sizedDraft));
+            return;
+          }
+
+          if (numericMatches.length < 2) {
+            pushAssistantMessage(`For add liquidity, enter both amounts like \`100,200\` (amount0,amount1) or a percent like \`50%\`.`);
+            return;
+          }
+          const amount0 = toCleanAmount(Number(numericMatches[0]));
+          const amount1 = toCleanAmount(Number(numericMatches[1]));
+          const nextDraft: TransactionDraft = {
+            ...pendingConfirmation.draft,
+            params: {
+              ...pendingConfirmation.draft.params,
+              token0,
+              token1,
+              amount0,
+              amount1,
+            },
+          };
+          setPendingConfirmation(buildPendingConfirmation(nextDraft));
+          return;
+        }
+      }
+    },
+    [
+      pendingConfirmation,
+      pushAssistantMessage,
+      toCleanAmount,
+      buildPendingConfirmation,
+      buildAddLiquidityDraftFromPair,
+      setActions,
+    ]
   );
 
   const handleConfirmNo = useCallback(() => {
@@ -899,8 +2032,13 @@ export default function Index() {
           ? `https://sepolia.basescan.org/tx/${result.txHash}`
           : `https://blockscout-passet-hub.parity-testnet.parity.io/tx/${result.txHash}`
         : "";
+      const swapDetails = result.swap;
+      const swapSummary =
+        action.draft.intent === "swap" && swapDetails
+          ? `\nSwapped ${swapDetails.amountIn} ${swapDetails.fromToken} for ~${swapDetails.amountOutEstimated} ${swapDetails.toToken}. (Estimated)`
+          : "";
       pushAssistantMessage(
-        `Transaction successful for ${action.draft.intent.toUpperCase()}.\nTx ID: ${txHashLabel}${txExplorer ? `\nExplorer: ${txExplorer}` : ""}`
+        `Transaction successful for ${action.draft.intent.toUpperCase()}.\nTx ID: ${txHashLabel}${txExplorer ? `\nExplorer: ${txExplorer}` : ""}${swapSummary}`
       );
     },
     [address, chainId, switchChainAsync, actions, execute, saveTransaction, pushAssistantMessage]
@@ -953,16 +2091,25 @@ export default function Index() {
                         id: pendingConfirmation.id,
                         prompt: pendingConfirmation.prompt,
                         options: pendingConfirmation.options,
+                        customInput: pendingConfirmation.customInput,
                       }
                     : null
                 }
                 onConfirmYes={handleConfirmYes}
                 onConfirmNo={handleConfirmNo}
                 onSelectOption={handleSelectOption}
+                onCustomInputSubmit={handleCustomInputSubmit}
                 emptyPlaceholder={
                   <div className="text-center space-y-4 px-4">
+                    <img
+                      src="/rosepolka.png"
+                      alt="Rose PolkaAi"
+                      width={96}
+                      height={96}
+                      className="mx-auto rounded-2xl object-cover shadow-lg border border-white/10"
+                    />
                     <h1 className="text-3xl sm:text-4xl font-medium text-[#f5f5f7] tracking-tight">
-                      RosePolkaAi — your AI DeFi copilot for Polkadot Hub
+                      Rose PolkaAi — your AI DeFi copilot for Polkadot Hub
                     </h1>
                     <p className="text-sm text-white/65 max-w-xl mx-auto">
                       Swap, bridge, stake, lend, mint NFTs, check portfolio balances, and ask crypto/finance questions in one place.
@@ -1062,7 +2209,10 @@ export default function Index() {
         </div>
 
         <header className="hidden lg:flex items-center justify-between px-6 py-4 border-b border-white/10 bg-[#050508]">
-          <div className="text-base font-medium">DeFAI Assistant</div>
+          <div className="flex items-center gap-3">
+            <img src="/rosepolka.png" alt="" width={36} height={36} className="rounded-xl object-cover" />
+            <span className="text-base font-medium">Rose PolkaAi</span>
+          </div>
           <WalletButton />
         </header>
 

@@ -5,6 +5,10 @@ import { Search, ArrowRight, Zap } from "lucide-react";
 const SUGGESTIONS = [
   "Swap 100 USDC to USDT",
   "Swap 500 USDT for USDC",
+  "Swap 25 USDT to TCC",
+  "Swap 25 USDC to DOMAIN",
+  "Add liquidity 100 USDC and 100 USDT",
+  "Remove liquidity 10 LP",
   "Bridge 100 USDC from Polkadot Hub to Base",
   "Bridge 0.05 ETH from Base to Polkadot Hub",
   "Stake 500 USDC",
@@ -61,7 +65,15 @@ export default function CommandBar({ onCommand, isProcessing }: CommandBarProps)
 
   const detectIntent = useCallback((text: string) => {
     const lower = text.toLowerCase();
+    const hasLiquidityWord = /\b(lp|liquidity|liq[a-z]*)\b/i.test(lower);
+    const isRemoveLiquidity = hasLiquidityWord && /\b(remove|withdraw|exit)\b/i.test(lower);
+    const isAddLiquidity =
+      hasLiquidityWord &&
+      (/\b(add|provide|deposit)\b/i.test(lower) || /\bpair\b|\/|paired|equivalent|pool\b/i.test(lower));
+
     if (lower.includes("unlend") || (lower.includes("withdraw") && lower.includes("lend"))) return "unlend";
+    if (isRemoveLiquidity) return "removeLiquidity";
+    if (isAddLiquidity) return "addLiquidity";
     if (lower.includes("swap") || lower.includes("exchange")) return "swap";
     if (lower.includes("bridge") || lower.includes("cross-chain")) return "bridge";
     if (lower.includes("lend") || lower.includes("supply")) return "lend";

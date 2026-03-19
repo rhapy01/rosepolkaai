@@ -8,6 +8,8 @@ const INTENT_ICONS: Record<string, React.ElementType> = {
   bridge: Globe,
   stake: Coins,
   unstake: ArrowDownUp,
+  addLiquidity: Coins,
+  removeLiquidity: ArrowDownUp,
   lend: Landmark,
   mint: Palette,
   launchpad: Rocket,

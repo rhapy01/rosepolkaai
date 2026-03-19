@@ -48,8 +48,9 @@ async function main() {
   const destinationRpc = getVar("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org");
   const sourceChainId = BigInt(getVar("SOURCE_CHAIN_ID", "420420417"));
   const destinationChainId = BigInt(getVar("DESTINATION_CHAIN_ID", "84532"));
-  const sourceBridgeAddress = getVar("HUB_BRIDGE_GATEWAY");
-  const destinationBridgeAddress = getVar("BASE_BRIDGE_GATEWAY");
+  // Default addresses are kept in sync with `src/lib/contract.ts`
+  const sourceBridgeAddress = getVar("HUB_BRIDGE_GATEWAY", "0xf0a5F7B7692A8F7824125CAd45f1c843110e0457");
+  const destinationBridgeAddress = getVar("BASE_BRIDGE_GATEWAY", "0x6B547BE75203e0C4c54071e9E9c235F36D642A06");
   if (!sourceBridgeAddress || !destinationBridgeAddress) {
     throw new Error("Missing HUB_BRIDGE_GATEWAY or BASE_BRIDGE_GATEWAY.");
   }

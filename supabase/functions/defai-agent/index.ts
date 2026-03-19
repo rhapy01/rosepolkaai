@@ -15,7 +15,7 @@ Your role:
 AUTHORITATIVE PLATFORM KNOWLEDGE:
 - Product: DeFAI Pal (conversational DeFi interface)
 - Core value: users type intent in natural language, review a draft, confirm, sign, and execute on-chain
-- Main flows: swap, bridge, stake, unstake, lend, unlend, mint NFT, claim demo tokens, points
+- Main flows: swap, bridge, stake, unstake, lend, unlend, add/remove liquidity, mint NFT, claim demo tokens, points
 - Platform fee: 0.1% on executable transactions
 - Incentive: 100 points per executed transaction
 - Positioning: AI transaction assistant with policy-aware execution UX, not a token-only app
@@ -37,14 +37,16 @@ SUPPORTED INTENTS:
 2. bridge
 3. stake
 4. unstake
-5. lend
-6. unlend
-7. mint
-8. launchpad
-9. points
-10. chat
-11. research
-12. claim
+5. addLiquidity
+6. removeLiquidity
+7. lend
+8. unlend
+9. mint
+10. launchpad
+11. points
+12. chat
+13. research
+14. claim
 
 INTENT GUIDELINES:
 - For executable intents, produce concise transaction-ready drafts.
@@ -71,13 +73,15 @@ EXECUTION NOTES:
 - Always include gasEstimate.
 - Mention 0.1% fee and 100 points in executable-flow messaging.
 - If request is ambiguous, include warnings and safe defaults.
+- For swap: if the user does not name any tickers (e.g. only "swap"), omit fromToken, toToken, and amount from params — the app will ask using wallet balances. Do not guess USDC.
+- For stake/unstake: if the user does not name a hub ticker (USDC, USDT, DOMAIN, TCC, TCX, TCH, PAI, HLT, RWA, YIELD, INFRA, CARB), omit token and amount — the app lists vault-eligible balances / staked positions. Do not default to USDC.
 - For launchpad requests, capture: tokenName, tokenSymbol, totalSupply, burnEnabled, tradingTaxBps, taxRecipient, taxBurnBps, owner.
 
 Return strict JSON only (no markdown wrappers around JSON).
 
 JSON schema:
 {
-  "intent": "swap|bridge|lend|unlend|stake|unstake|mint|launchpad|points|chat|research|claim",
+  "intent": "swap|bridge|addLiquidity|removeLiquidity|lend|unlend|stake|unstake|mint|launchpad|points|chat|research|claim",
   "summary": "string",
   "params": { "key": "value pairs as strings" },
   "gasEstimate": "string",
@@ -85,7 +89,7 @@ JSON schema:
   "warnings": ["optional warning strings"]
 }`;
 
-const INTENTS = ["swap", "bridge", "lend", "unlend", "stake", "unstake", "mint", "launchpad", "points", "chat", "research", "claim"] as const;
+const INTENTS = ["swap", "bridge", "addLiquidity", "removeLiquidity", "lend", "unlend", "stake", "unstake", "mint", "launchpad", "points", "chat", "research", "claim"] as const;
 
 type Intent = typeof INTENTS[number];
 type ResponseMode = "short" | "standard" | "deep";
@@ -97,6 +101,13 @@ type TransactionDraft = {
   gasEstimate: string;
   message: string;
   warnings?: string[];
+};
+
+type WalletContext = {
+  walletAddress?: string;
+  chainId?: number;
+  balances?: { symbol: string; formatted: string }[];
+  liquidityPairs?: string[];
 };
 
 function detectResponseMode(command: string): ResponseMode {
@@ -195,6 +206,75 @@ function extractSwapSymbolsFromCommand(command: string): string[] {
   return found;
 }
 
+/** Hub demo tokens with a deployed staking vault (same set as swaps). */
+function extractStakeSymbolsFromCommand(command: string): string[] {
+  return extractSwapSymbolsFromCommand(command);
+}
+
+function extractPairSymbolsFromCommand(command: string): [string, string] | null {
+  const upper = command.toUpperCase();
+
+  // Strongest signal: explicit pair format, e.g. "USDT/TCC"
+  const slashMatch = upper.match(/\b([A-Z0-9]{2,12})\s*\/\s*([A-Z0-9]{2,12})\b/);
+  if (slashMatch) {
+    const a = normalizeSymbol(slashMatch[1], "");
+    const b = normalizeSymbol(slashMatch[2], "");
+    if (SWAP_ALLOWED_TOKENS.has(a) && SWAP_ALLOWED_TOKENS.has(b) && a !== b) {
+      return [a, b];
+    }
+  }
+
+  // "pair usdt tcc" / "pair: usdt, tcc"
+  const pairWordMatch = upper.match(/\bPAIR\b[\s:,-]*([A-Z0-9]{2,12})[\s,/:-]+([A-Z0-9]{2,12})\b/);
+  if (pairWordMatch) {
+    const a = normalizeSymbol(pairWordMatch[1], "");
+    const b = normalizeSymbol(pairWordMatch[2], "");
+    if (SWAP_ALLOWED_TOKENS.has(a) && SWAP_ALLOWED_TOKENS.has(b) && a !== b) {
+      return [a, b];
+    }
+  }
+
+  return null;
+}
+
+function parseLooseAmount(raw: string | undefined, fallback: string): string {
+  if (!raw) return fallback;
+  // Handle common typo/ocr cases such as "5o" -> "50"
+  const normalized = raw
+    .replace(/[oO](\d)/g, "0$1")
+    .replace(/(\d)[oO]/g, "$10")
+    .replace(/[^0-9.]/g, "");
+  return normalized || fallback;
+}
+
+function extractFirstAmountFromCommand(command: string, fallback: string): string {
+  const m = command.match(/(\d[\d.,oO]*)/);
+  return parseLooseAmount(m?.[1], fallback);
+}
+
+function extractSecondAmountFromCommand(command: string, fallback: string): string {
+  const matches = [...command.matchAll(/(\d[\d.,oO]*)/g)];
+  if (matches.length < 2) return fallback;
+  return parseLooseAmount(matches[1]?.[1], fallback);
+}
+
+function hasLiquidityWord(text: string): boolean {
+  // catches "liquidity", "liqidity", "liqudity", etc.
+  return /\bliq[a-z]*\b/i.test(text);
+}
+
+function isLikelyAddLiquidityCommand(text: string): boolean {
+  const lower = text.toLowerCase();
+  const hasPairHint = /\bpair\b|\/|paired|equivalent|pool\b/i.test(lower);
+  const hasActionHint = /\b(add|provide|deposit)\b/i.test(lower);
+  return hasLiquidityWord(lower) && (hasActionHint || hasPairHint);
+}
+
+function isLikelyRemoveLiquidityCommand(text: string): boolean {
+  const lower = text.toLowerCase();
+  return hasLiquidityWord(lower) && /\b(remove|withdraw|exit)\b/i.test(lower);
+}
+
 function extractJsonObject(text: string): string | null {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -202,7 +282,7 @@ function extractJsonObject(text: string): string | null {
   return text.slice(start, end + 1);
 }
 
-function normalizeDraft(raw: unknown, command = ""): TransactionDraft {
+function normalizeDraft(raw: unknown, command = "", walletContext?: WalletContext): TransactionDraft {
   const lowerCommand = command.toLowerCase();
   const isSmallTalk = /^(thanks|thank you|thx|ok|okay|cool|great|nice|got it|hello|hi|hey|bye)\b/i.test(command.trim());
   const launchTokenRequested =
@@ -262,9 +342,36 @@ function normalizeDraft(raw: unknown, command = ""): TransactionDraft {
     draft.summary = "Launch token request detected from command.";
   }
 
+  // Hard guardrail: liquidity language should not become lending.
+  if (isLikelyRemoveLiquidityCommand(command) && draft.intent !== "removeLiquidity") {
+    draft.intent = "removeLiquidity";
+    draft.summary = "Remove liquidity request detected from command.";
+  } else if (isLikelyAddLiquidityCommand(command) && draft.intent !== "addLiquidity") {
+    draft.intent = "addLiquidity";
+    draft.summary = "Add liquidity request detected from command.";
+  }
+
   // Normalize toward executable defaults for deployed contracts.
   if (draft.intent === "swap") {
     const commandSymbols = extractSwapSymbolsFromCommand(command);
+
+    // Bare "swap" with no tickers: do not inject USDC→USDT — client uses wallet balances to pick assets.
+    if (commandSymbols.length === 0) {
+      delete draft.params.fromToken;
+      delete draft.params.toToken;
+      delete draft.params.amount;
+      draft.params.protocol = "DeFAI AMM Pool";
+      if (!draft.message?.trim()) {
+        draft.message =
+          "You asked to swap but didn’t name which assets. Pick the token you’re selling, then what you want to receive — I’ll use your live balances.";
+      }
+      draft.warnings = [
+        ...(draft.warnings ?? []),
+        "No token tickers in your message; the app will walk you through token selection using your wallet.",
+      ];
+      return draft;
+    }
+
     const requestedToken = normalizeSymbol(draft.params.toToken || draft.params.token, "USDT");
     const fromTokenRaw = normalizeSymbol(draft.params.fromToken, "USDC");
     const toTokenRaw = requestedToken;
@@ -288,10 +395,141 @@ function normalizeDraft(raw: unknown, command = ""): TransactionDraft {
     draft.params.fromToken = effectiveFromToken;
     draft.params.toToken = toToken;
     draft.params.amount = draft.params.amount || "10";
-    draft.params.protocol = "DeFAISimpleSwap";
+    draft.params.protocol = "DeFAI AMM Pool";
 
     if ((!SWAP_ALLOWED_TOKENS.has(fromTokenRaw) || !SWAP_ALLOWED_TOKENS.has(toTokenRaw) || fromTokenRaw === toTokenRaw) && commandSymbols.length === 0) {
       draft.warnings = [...(draft.warnings ?? []), "Swap token unsupported or ambiguous. Using supported token defaults."];
+    }
+  }
+
+  if (draft.intent === "addLiquidity") {
+    const pairFromCommand = extractPairSymbolsFromCommand(command);
+    const commandSymbols = extractSwapSymbolsFromCommand(command);
+    const llmToken0 = normalizeSymbol(draft.params.token0 || draft.params.tokenA, "");
+    const llmToken1 = normalizeSymbol(draft.params.token1 || draft.params.tokenB, "");
+    const token0 = normalizeSymbol(
+      pairFromCommand?.[0] || (SWAP_ALLOWED_TOKENS.has(llmToken0) ? llmToken0 : "") || commandSymbols[0],
+      "USDC"
+    );
+    const token1 = normalizeSymbol(
+      pairFromCommand?.[1] || (SWAP_ALLOWED_TOKENS.has(llmToken1) ? llmToken1 : "") || commandSymbols[1],
+      token0 === "USDC" ? "USDT" : "USDC"
+    );
+    draft.params.token0 = token0;
+    draft.params.token1 = token1 === token0 ? (token0 === "USDC" ? "USDT" : "USDC") : token1;
+    const amount0FromCmd = extractFirstAmountFromCommand(command, "100");
+    const amount1FromCmd = extractSecondAmountFromCommand(command, amount0FromCmd);
+    const hasEquivalentMode = /\bequivalent\b|\beqv\b|\bvalue\b/i.test(command.toLowerCase());
+    const rawAmount0 = parseLooseAmount(draft.params.amount0 || draft.params.amount, amount0FromCmd);
+    const rawAmount1 = parseLooseAmount(draft.params.amount1, amount1FromCmd);
+    const singleAmountInCommand = [...command.matchAll(/(\d[\d.,oO]*)/g)].length === 1;
+    if (hasEquivalentMode && singleAmountInCommand) {
+      const total = Number(rawAmount0);
+      const half = Number.isFinite(total) && total > 0 ? (total / 2).toString() : rawAmount0;
+      draft.params.usdcEquivalentTotal = rawAmount0;
+      draft.params.amount0 = half;
+      draft.params.amount1 = half;
+      const stableSymbols = new Set(["USDC", "USDT"]);
+      const hasStableSide = stableSymbols.has(draft.params.token0) || stableSymbols.has(draft.params.token1);
+      if (!hasStableSide) {
+        draft.warnings = [
+          ...(draft.warnings ?? []),
+          "USDC-equivalent mode is most reliable when one side is USDC/USDT. This pair has no stable side; review quote basis before confirming.",
+        ];
+      }
+    } else {
+      draft.params.amount0 = rawAmount0;
+      draft.params.amount1 = rawAmount1;
+    }
+    draft.params.protocol = "DeFAI AMM Pool";
+  }
+
+  if (draft.intent === "removeLiquidity") {
+    const pairFromCommand = extractPairSymbolsFromCommand(command);
+    const commandSymbols = extractSwapSymbolsFromCommand(command);
+    const llmToken0 = normalizeSymbol(draft.params.token0 || draft.params.tokenA, "");
+    const llmToken1 = normalizeSymbol(draft.params.token1 || draft.params.tokenB, "");
+    const ctxPairs = (walletContext?.liquidityPairs || [])
+      .map((p) => String(p).toUpperCase().trim())
+      .filter((p) => /^[A-Z0-9]{2,12}\/[A-Z0-9]{2,12}$/.test(p));
+    const hasExplicitPairInCommand = !!pairFromCommand || commandSymbols.length >= 2;
+    const hasPct = /(\d+(?:\.\d+)?)\s*%/i.test(command);
+    const hasMax = /\b(all|max)\b/i.test(command);
+    const hasAbsoluteAmount = /(\d[\d.,oO]*)/i.test(command);
+    const amountMissing = !hasPct && !hasMax && !hasAbsoluteAmount;
+
+    draft.params.protocol = "DeFAI AMM Pool";
+
+    // If user didn't specify a pair, do not trust model-guessed token pair.
+    // Use wallet context only: none => no removable position, one => auto-select, many => ask.
+    if (!hasExplicitPairInCommand) {
+      if (ctxPairs.length === 0) {
+        draft.params.requiresPair = "true";
+        draft.params.availablePairs = "";
+        draft.summary = "No removable liquidity position found";
+        draft.message = "I could not find a removable liquidity position for this wallet.";
+        return draft;
+      }
+      if (ctxPairs.length > 1) {
+        draft.params.requiresPair = "true";
+        draft.params.availablePairs = ctxPairs.join(", ");
+        draft.summary = "Need pair selection for remove liquidity";
+        draft.message = `You have multiple liquidity positions. Which pair should I remove from?\n${ctxPairs.join(", ")}`;
+        if (amountMissing) {
+          draft.params.requiresAmount = "true";
+          draft.params.suggestedPercents = "25%,50%,75%,100%";
+        }
+        return draft;
+      }
+    }
+
+    let resolvedPair = pairFromCommand;
+    if (!resolvedPair && ctxPairs.length === 1) {
+      const [a, b] = ctxPairs[0].split("/");
+      resolvedPair = [a, b];
+    }
+
+    const token0 = normalizeSymbol(
+      resolvedPair?.[0] || (hasExplicitPairInCommand ? (SWAP_ALLOWED_TOKENS.has(llmToken0) ? llmToken0 : "") : "") || commandSymbols[0],
+      ""
+    );
+    const token1 = normalizeSymbol(
+      resolvedPair?.[1] || (hasExplicitPairInCommand ? (SWAP_ALLOWED_TOKENS.has(llmToken1) ? llmToken1 : "") : "") || commandSymbols[1],
+      ""
+    );
+    if (!token0 || !token1) {
+      draft.params.requiresPair = "true";
+      draft.params.availablePairs = ctxPairs.join(", ");
+      draft.summary = "Need pair selection for remove liquidity";
+      draft.params.protocol = "DeFAI AMM Pool";
+      if (amountMissing) {
+        draft.params.requiresAmount = "true";
+        draft.params.suggestedPercents = "25%,50%,75%,100%";
+      }
+      draft.message =
+        ctxPairs.length > 0
+          ? `Which liquidity pair should I remove from?\n${ctxPairs.join(", ")}`
+          : "I couldn't find a removable liquidity pair in your wallet context.";
+      return draft;
+    }
+    draft.params.token0 = token0;
+    draft.params.token1 = token1 === token0 ? (token0 === "USDC" ? "USDT" : "USDC") : token1;
+
+    if (amountMissing) {
+      draft.params.requiresAmount = "true";
+      draft.params.suggestedPercents = "25%,50%,75%,100%";
+      draft.summary = `Remove liquidity from ${draft.params.token0}/${draft.params.token1}`;
+      draft.message = `How much liquidity should I remove from ${draft.params.token0}/${draft.params.token1}?`;
+      return draft;
+    }
+    if (hasPct) {
+      const pct = command.match(/(\d+(?:\.\d+)?)\s*%/i)?.[1] || "25";
+      draft.params.lpAmount = `${pct}%`;
+    } else if (hasMax) {
+      draft.params.lpAmount = "100%";
+    } else {
+      const lpAmountFromCmd = extractFirstAmountFromCommand(command, "");
+      draft.params.lpAmount = parseLooseAmount(draft.params.lpAmount || draft.params.amount, lpAmountFromCmd);
     }
   }
 
@@ -316,14 +554,31 @@ function normalizeDraft(raw: unknown, command = ""): TransactionDraft {
   }
 
   if (draft.intent === "stake" || draft.intent === "unstake") {
-    const allowedStakeTokens = new Set(["USDC", "USDT"]);
-    const tokenRaw = (draft.params.token || "USDC").toUpperCase();
-    draft.params.token = allowedStakeTokens.has(tokenRaw) ? tokenRaw : "USDC";
-    draft.params.amount = draft.params.amount || "5";
-    draft.params.protocol = "DeFAIStakingVault";
-    if (!allowedStakeTokens.has(tokenRaw)) {
-      draft.warnings = [...(draft.warnings ?? []), "Staking demo currently supports USDC and USDT."];
+    const stakeSymbols = extractStakeSymbolsFromCommand(command);
+
+    if (stakeSymbols.length === 0) {
+      delete draft.params.token;
+      delete draft.params.amount;
+      draft.params.protocol = "DeFAIStakingVault";
+      if (!draft.message?.trim()) {
+        draft.message =
+          draft.intent === "stake"
+            ? "You asked to stake but didn’t name a hub token. Pick an asset — the app shows vault-eligible tokens and your wallet balance for each."
+            : "You asked to unstake but didn’t name a hub token. Pick an asset — the app shows what you have staked.";
+      }
+      draft.warnings = [
+        ...(draft.warnings ?? []),
+        draft.intent === "stake"
+          ? "No stake ticker in message; select asset in the UI (USDC, USDT, DOMAIN, TCC, TCX, TCH, PAI, HLT, RWA, YIELD, INFRA, CARB)."
+          : "No ticker in message; select what to unstake in the UI.",
+      ];
+      return draft;
     }
+
+    const tokenFromCmd = stakeSymbols[0];
+    draft.params.token = SWAP_ALLOWED_TOKENS.has(tokenFromCmd) ? tokenFromCmd : "USDC";
+    draft.params.amount = draft.params.amount || extractFirstAmountFromCommand(command, "5");
+    draft.params.protocol = "DeFAIStakingVault";
   }
 
   if (draft.intent === "lend" || draft.intent === "unlend") {
@@ -426,7 +681,7 @@ type ChatHistoryItem = {
   content: string;
 };
 
-async function callGroq(command: string, history: ChatHistoryItem[] = []): Promise<TransactionDraft> {
+async function callGroq(command: string, history: ChatHistoryItem[] = [], walletContext?: WalletContext): Promise<TransactionDraft> {
   const GROQ_API_KEY = Deno.env.get("GROQ_API_KEY");
   if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY is not configured");
   const responseMode = detectResponseMode(command);
@@ -447,6 +702,12 @@ async function callGroq(command: string, history: ChatHistoryItem[] = []): Promi
           content:
             `Response depth requested: ${responseMode}. ` +
             "For chat/research answers, match this depth: short=concise, standard=balanced, deep=comprehensive teaching with examples and risk notes.",
+        },
+        {
+          role: "system",
+          content:
+            `Live wallet context (authoritative): ${JSON.stringify(walletContext || {})}. ` +
+            "Use this context to resolve/remove ambiguity. If removeLiquidity pair or amount is missing, ask targeted clarification instead of hardcoded defaults.",
         },
         ...history
           .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
@@ -481,7 +742,7 @@ async function callGroq(command: string, history: ChatHistoryItem[] = []): Promi
   }
 
   const parsed = JSON.parse(jsonText);
-  return normalizeDraft(parsed, command);
+  return normalizeDraft(parsed, command, walletContext);
 }
 
 serve(async (req) => {
@@ -490,7 +751,7 @@ serve(async (req) => {
   }
 
   try {
-    const { command, history } = await req.json();
+    const { command, history, walletContext } = await req.json();
     
     if (!command || typeof command !== "string") {
       return new Response(JSON.stringify({ error: "Command is required" }), {
@@ -499,7 +760,11 @@ serve(async (req) => {
       });
     }
 
-    const parsed = await callGroq(command, Array.isArray(history) ? history as ChatHistoryItem[] : []);
+    const parsed = await callGroq(
+      command,
+      Array.isArray(history) ? history as ChatHistoryItem[] : [],
+      walletContext && typeof walletContext === "object" ? walletContext as WalletContext : undefined
+    );
 
     return new Response(JSON.stringify(parsed), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },

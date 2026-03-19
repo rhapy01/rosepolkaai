@@ -18,9 +18,12 @@ contract DeFAISimpleSwap is AccessControl, Pausable, ReentrancyGuard {
 
     // Pair rate in 1e18 precision: amountOut = amountIn * rate / 1e18
     mapping(address => mapping(address => uint256)) public pairRate;
+    // Per-provider liquidity accounting (single-asset vault style, for demos)
+    mapping(address => mapping(address => uint256)) public liquidityOf; // token => provider => amount
 
     event PairRateUpdated(address indexed tokenIn, address indexed tokenOut, uint256 previousRate, uint256 newRate);
     event LiquidityAdded(address indexed token, address indexed from, uint256 amount);
+    event LiquidityRemoved(address indexed token, address indexed to, uint256 amount);
     event Swapped(
         address indexed user,
         address indexed tokenIn,
@@ -64,6 +67,31 @@ contract DeFAISimpleSwap is AccessControl, Pausable, ReentrancyGuard {
         if (amount == 0) revert InvalidAmount();
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         emit LiquidityAdded(token, msg.sender, amount);
+    }
+
+    /**
+     * @notice Provide liquidity to the swap contract (for demo purposes).
+     * @dev Tracks per-provider deposits to allow later withdrawals.
+     */
+    function provideLiquidity(address token, uint256 amount) external whenNotPaused nonReentrant {
+        if (token == address(0)) revert ZeroAddress();
+        if (amount == 0) revert InvalidAmount();
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        liquidityOf[token][msg.sender] += amount;
+        emit LiquidityAdded(token, msg.sender, amount);
+    }
+
+    /**
+     * @notice Remove previously provided liquidity.
+     */
+    function removeLiquidity(address token, uint256 amount, address to) external whenNotPaused nonReentrant {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert InvalidAmount();
+        uint256 available = liquidityOf[token][msg.sender];
+        if (available < amount) revert InsufficientLiquidity(available, amount);
+        liquidityOf[token][msg.sender] = available - amount;
+        IERC20(token).safeTransfer(to, amount);
+        emit LiquidityRemoved(token, to, amount);
     }
 
     function quote(address tokenIn, address tokenOut, uint256 amountIn) public view returns (uint256 amountOut) {

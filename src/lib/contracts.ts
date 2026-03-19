@@ -86,6 +86,16 @@ export const DEFAI_SIMPLE_SWAP_ABI: Abi = [
     outputs: [{ name: "", type: "uint256" }],
   },
   {
+    name: "liquidityOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "provider", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
     name: "swapExactInput",
     type: "function",
     stateMutability: "nonpayable",
@@ -97,6 +107,27 @@ export const DEFAI_SIMPLE_SWAP_ABI: Abi = [
       { name: "recipient", type: "address" },
     ],
     outputs: [{ name: "amountOut", type: "uint256" }],
+  },
+  {
+    name: "provideLiquidity",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [],
+  },
+  {
+    name: "removeLiquidity",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "amount", type: "uint256" },
+      { name: "to", type: "address" },
+    ],
+    outputs: [],
   },
   {
     name: "quote",
@@ -208,12 +239,26 @@ export const BASE_TOKENS: Record<string, Address> = {
 
 // App contract addresses (centralized)
 export const HUB_DEX_ROUTER: Address = CONTRACTS.polkadotTestnet.defaiSimpleSwap;
+export const HUB_AMM_POOL: Address = CONTRACTS.polkadotTestnet.defaiAmmPool;
 export const HUB_STAKING_VAULT_USDC: Address = CONTRACTS.polkadotTestnet.defaiStakingVaultUSDC;
 export const HUB_STAKING_VAULT_USDT: Address = CONTRACTS.polkadotTestnet.defaiStakingVaultUSDT;
+/** One vault per hub demo token (12 total). */
 export const HUB_STAKING_VAULTS: Record<string, Address> = {
-  USDC: HUB_STAKING_VAULT_USDC,
-  USDT: HUB_STAKING_VAULT_USDT,
+  USDC: CONTRACTS.polkadotTestnet.defaiStakingVaultUSDC,
+  USDT: CONTRACTS.polkadotTestnet.defaiStakingVaultUSDT,
+  DOMAIN: CONTRACTS.polkadotTestnet.defaiStakingVaultDOMAIN,
+  TCC: CONTRACTS.polkadotTestnet.defaiStakingVaultTCC,
+  TCX: CONTRACTS.polkadotTestnet.defaiStakingVaultTCX,
+  TCH: CONTRACTS.polkadotTestnet.defaiStakingVaultTCH,
+  PAI: CONTRACTS.polkadotTestnet.defaiStakingVaultPAI,
+  HLT: CONTRACTS.polkadotTestnet.defaiStakingVaultHLT,
+  RWA: CONTRACTS.polkadotTestnet.defaiStakingVaultRWA,
+  YIELD: CONTRACTS.polkadotTestnet.defaiStakingVaultYIELD,
+  INFRA: CONTRACTS.polkadotTestnet.defaiStakingVaultINFRA,
+  CARB: CONTRACTS.polkadotTestnet.defaiStakingVaultCARB,
 };
+/** Symbols with an on-chain staking vault (same keys as HUB_STAKING_VAULTS). */
+export const HUB_STAKEABLE_SYMBOLS = Object.keys(HUB_STAKING_VAULTS) as readonly string[];
 // Backward compatibility for older consumers.
 export const HUB_STAKING_VAULT: Address = HUB_STAKING_VAULT_USDC;
 export const HUB_PLATFORM: Address = CONTRACTS.polkadotTestnet.defaiPlatform;
@@ -224,6 +269,88 @@ export const HUB_TOKEN_FACTORY: Address = CONTRACTS.polkadotTestnet.defaiTokenFa
 export const HUB_BRIDGE_GATEWAY: Address = CONTRACTS.polkadotTestnet.defaiBridgeGateway;
 export const BASE_BRIDGE_GATEWAY: Address = CONTRACTS.baseSepolia.defaiBridgeGateway;
 export const BASE_SEPOLIA_CHAIN_ID = BASE_SEPOLIA_CHAIN_ID_VALUE;
+
+// DeFAI AMM Pool ABI (execution subset)
+export const DEFAI_AMM_POOL_ABI: Abi = [
+  {
+    name: "token0",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+  {
+    name: "token1",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+  {
+    name: "getReserves",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [
+      { name: "_reserve0", type: "uint112" },
+      { name: "_reserve1", type: "uint112" },
+    ],
+  },
+  {
+    name: "quote",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "tokenIn", type: "address" },
+      { name: "amountIn", type: "uint256" },
+    ],
+    outputs: [{ name: "amountOut", type: "uint256" }],
+  },
+  {
+    name: "addLiquidity",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount0Desired", type: "uint256" },
+      { name: "amount1Desired", type: "uint256" },
+      { name: "amount0Min", type: "uint256" },
+      { name: "amount1Min", type: "uint256" },
+      { name: "to", type: "address" },
+    ],
+    outputs: [
+      { name: "liquidity", type: "uint256" },
+      { name: "amount0", type: "uint256" },
+      { name: "amount1", type: "uint256" },
+    ],
+  },
+  {
+    name: "removeLiquidity",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "liquidity", type: "uint256" },
+      { name: "amount0Min", type: "uint256" },
+      { name: "amount1Min", type: "uint256" },
+      { name: "to", type: "address" },
+    ],
+    outputs: [
+      { name: "amount0", type: "uint256" },
+      { name: "amount1", type: "uint256" },
+    ],
+  },
+  {
+    name: "swapExactInput",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "tokenIn", type: "address" },
+      { name: "amountIn", type: "uint256" },
+      { name: "minAmountOut", type: "uint256" },
+      { name: "to", type: "address" },
+    ],
+    outputs: [{ name: "amountOut", type: "uint256" }],
+  },
+];
 
 // DeFAI bridge gateway ABI (execution subset)
 export const DEFAI_BRIDGE_GATEWAY_ABI: Abi = [

@@ -54,7 +54,10 @@ export default function TopBar({ activeTab = "home", onNavigate }: TopBarProps) 
             <StatItem icon={Fuel} label="Gas" value="0.012 DOT" />
           </div>
 
-          <span className="md:hidden text-xs font-semibold text-foreground">DeFAI</span>
+          <div className="md:hidden flex items-center gap-2">
+            <img src="/rosepolka.png" alt="" width={28} height={28} className="rounded-lg object-cover shrink-0" />
+            <span className="text-xs font-semibold text-foreground">Rose PolkaAi</span>
+          </div>
         </div>
 
         <WalletButton />
