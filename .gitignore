@@ -31,3 +31,7 @@ ignition/deployments
 .coverage_contracts
 
 .vercel
+
+# Environment files (never commit secrets)
+.env
+.env.*
